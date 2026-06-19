@@ -12,7 +12,10 @@ use p256::{EncodedPoint, PublicKey};
 use prost::Message;
 use rand::Rng;
 use sha2::{Digest, Sha256, Sha512};
-use tokio::io::AsyncWriteExt;
+use std::pin::Pin;
+use std::task::{Context, Poll};
+
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf};
 use tokio::net::TcpStream;
 use tokio::sync::broadcast::{Receiver, Sender};
 
@@ -46,15 +49,77 @@ const SANE_FRAME_LENGTH: i32 = 5 * 1024 * 1024;
 const SANITY_DURATION: Duration = Duration::from_micros(10);
 
 #[derive(Debug)]
-pub struct InboundRequest {
-    socket: TcpStream,
+/// A swappable transport so a connection bootstrapped over BLE L2CAP (the duplex
+/// bridge) can be upgraded to WiFi-LAN (TCP) mid-session without disturbing the
+/// InboundRequest's UKEY2 / sequence state.
+pub enum Transport {
+    Duplex(DuplexStream),
+    Tcp(TcpStream),
+}
+
+impl AsyncRead for Transport {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Transport::Duplex(s) => Pin::new(s).poll_read(cx, buf),
+            Transport::Tcp(s) => Pin::new(s).poll_read(cx, buf),
+        }
+    }
+}
+
+impl AsyncWrite for Transport {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        match self.get_mut() {
+            Transport::Duplex(s) => Pin::new(s).poll_write(cx, buf),
+            Transport::Tcp(s) => Pin::new(s).poll_write(cx, buf),
+        }
+    }
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Transport::Duplex(s) => Pin::new(s).poll_flush(cx),
+            Transport::Tcp(s) => Pin::new(s).poll_flush(cx),
+        }
+    }
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Transport::Duplex(s) => Pin::new(s).poll_shutdown(cx),
+            Transport::Tcp(s) => Pin::new(s).poll_shutdown(cx),
+        }
+    }
+}
+
+pub struct InboundRequest<S = TcpStream> {
+    socket: S,
     pub state: InnerState,
     sender: Sender<ChannelMessage>,
     receiver: Receiver<ChannelMessage>,
+    // Set right after a WiFi bandwidth upgrade: the first frame on the new
+    // channel is a PLAINTEXT CLIENT_INTRODUCTION (encryption resumes after).
+    awaiting_introduction: bool,
+    // When set, defer the first sharing frame until after the WiFi upgrade so the
+    // sequence counters stay in lockstep across the medium switch.
+    wifi_upgrade_pending: bool,
+    // Set when the phone sends UPGRADE_FAILURE for our WiFi offer, so the driver
+    // can fall back to L2CAP immediately instead of blocking on the dead accept().
+    pub upgrade_rejected: bool,
+    // Set when the phone sends LAST_WRITE_TO_PRIOR_CHANNEL on the old (L2CAP)
+    // channel — its final frame there. The driver drains the old channel up to
+    // this point before switching to WiFi so the d2d sequence stays in lockstep.
+    pub prior_channel_drained: bool,
+    // Set when the phone sends BANDWIDTH_UPGRADE_RETRY (its WiFi just recovered),
+    // so the driver re-offers the WIFI_LAN upgrade.
+    pub wifi_retry_requested: bool,
 }
 
-impl InboundRequest {
-    pub fn new(socket: TcpStream, id: String, sender: Sender<ChannelMessage>) -> Self {
+impl<S: AsyncRead + AsyncWrite + Unpin + Send> InboundRequest<S> {
+    pub fn new(socket: S, id: String, sender: Sender<ChannelMessage>) -> Self {
         let receiver = sender.subscribe();
 
         Self {
@@ -69,7 +134,133 @@ impl InboundRequest {
             },
             sender,
             receiver,
+            awaiting_introduction: false,
+            wifi_upgrade_pending: false,
+            upgrade_rejected: false,
+            prior_channel_drained: false,
+            wifi_retry_requested: false,
         }
+    }
+
+    /// Mark that this connection will be upgraded to WiFi, so the first sharing
+    /// frame is deferred until after the medium switch (keeps sequences in sync).
+    pub fn enable_wifi_upgrade(&mut self) {
+        self.wifi_upgrade_pending = true;
+    }
+
+    /// Call right after swapping to the WiFi transport: the next frame will be a
+    /// plaintext CLIENT_INTRODUCTION that we must ack before encryption resumes.
+    pub fn expect_client_introduction(&mut self) {
+        self.awaiting_introduction = true;
+    }
+
+    /// The WiFi upgrade didn't happen — fall back to the current (L2CAP) channel
+    /// by sending the sharing frame we deferred, so the transfer can still run.
+    pub async fn abort_wifi_upgrade(&mut self) -> Result<(), anyhow::Error> {
+        if self.wifi_upgrade_pending {
+            self.wifi_upgrade_pending = false;
+            self.send_paired_key_encryption().await?;
+        }
+        Ok(())
+    }
+
+    /// After a successful WiFi upgrade, kick off the deferred sharing protocol on
+    /// the new channel (no-op unless the deferral is enabled).
+    pub async fn send_deferred_after_upgrade(&mut self) -> Result<(), anyhow::Error> {
+        if self.wifi_upgrade_pending {
+            self.wifi_upgrade_pending = false;
+            self.send_paired_key_encryption().await?;
+        }
+        Ok(())
+    }
+
+    /// Reply to the phone's LAST_WRITE_TO_PRIOR_CHANNEL with SAFE_TO_CLOSE on the
+    /// old (L2CAP) channel, per the BWU handshake, so the phone finalizes the
+    /// medium switch. Encrypted (advances the d2d sequence) like LAST_WRITE.
+    pub async fn send_safe_to_close(&mut self) -> Result<(), anyhow::Error> {
+        use crate::location_nearby_connections as lnc;
+        use lnc::bandwidth_upgrade_negotiation_frame as bwu;
+        let frame = OfflineFrame {
+            version: Some(lnc::offline_frame::Version::V1.into()),
+            v1: Some(lnc::V1Frame {
+                r#type: Some(lnc::v1_frame::FrameType::BandwidthUpgradeNegotiation.into()),
+                bandwidth_upgrade_negotiation: Some(lnc::BandwidthUpgradeNegotiationFrame {
+                    event_type: Some(bwu::EventType::SafeToClosePriorChannel.into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+        };
+        self.encrypt_and_send(&frame).await
+    }
+
+    /// Drain the old (L2CAP) channel after the WiFi socket connects: keep reading
+    /// and processing its frames — advancing the inbound d2d sequence — until the
+    /// phone sends LAST_WRITE_TO_PRIOR_CHANNEL (its final frame there). Without this
+    /// we'd switch to WiFi mid-stream and miss that frame, desyncing the sequence
+    /// (the "6 vs 5" error). Bounded so a phone that never sends LAST_WRITE can't
+    /// hang the handover — we switch anyway after the timeout.
+    pub async fn drain_prior_channel(&mut self) -> Result<(), anyhow::Error> {
+        self.prior_channel_drained = false;
+        while !self.prior_channel_drained {
+            let mut length_buf = [0u8; 4];
+            let read = stream_read_exact(&mut self.socket, &mut length_buf);
+            match tokio::time::timeout(std::time::Duration::from_secs(3), read).await {
+                Ok(r) => {
+                    r?;
+                    self._handle(length_buf).await?;
+                }
+                Err(_) => {
+                    warn!("BWU: no LAST_WRITE_TO_PRIOR_CHANNEL within 3s; switching anyway");
+                    break;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Swap the underlying transport (used for the BLE L2CAP -> WiFi upgrade).
+    /// The InnerState (UKEY2 keys, sequence counters) is preserved.
+    pub fn set_socket(&mut self, socket: S) {
+        self.socket = socket;
+    }
+
+    /// Send a BANDWIDTH_UPGRADE_NEGOTIATION / UPGRADE_PATH_AVAILABLE offering a
+    /// WIFI_LAN socket, so the sender connects over TCP for the bulk transfer.
+    pub async fn send_wifi_upgrade(&mut self, ip: [u8; 4], port: u16) -> Result<(), anyhow::Error> {
+        use crate::location_nearby_connections as lnc;
+        use lnc::bandwidth_upgrade_negotiation_frame as bwu;
+
+        let frame = OfflineFrame {
+            version: Some(lnc::offline_frame::Version::V1.into()),
+            v1: Some(lnc::V1Frame {
+                r#type: Some(lnc::v1_frame::FrameType::BandwidthUpgradeNegotiation.into()),
+                bandwidth_upgrade_negotiation: Some(lnc::BandwidthUpgradeNegotiationFrame {
+                    event_type: Some(bwu::EventType::UpgradePathAvailable.into()),
+                    upgrade_path_info: Some(bwu::UpgradePathInfo {
+                        medium: Some(bwu::upgrade_path_info::Medium::WifiLan.into()),
+                        wifi_lan_socket: Some(bwu::upgrade_path_info::WifiLanSocket {
+                            ip_address: Some(ip.to_vec()),
+                            wifi_port: Some(port as i32),
+                            // Modern Pixel firmware ignores the legacy ip_address/
+                            // wifi_port and REQUIRES address_candidates; an offer
+                            // without it is rejected pre-connect (UPGRADE_FAILURE,
+                            // zero SYNs). Mirror the legacy IPv4 here.
+                            address_candidates: vec![lnc::ServiceAddress {
+                                ip_address: Some(ip.to_vec()),
+                                port: Some(port as i32),
+                            }],
+                        }),
+                        supports_client_introduction_ack: Some(true),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+        };
+        info!("BWU: offering WIFI_LAN {}.{}.{}.{}:{port}", ip[0], ip[1], ip[2], ip[3]);
+        self.encrypt_and_send(&frame).await
     }
 
     pub async fn handle(&mut self) -> Result<(), anyhow::Error> {
@@ -148,6 +339,42 @@ impl InboundRequest {
         let mut frame_data = vec![0u8; msg_length];
         stream_read_exact(&mut self.socket, &mut frame_data).await?;
 
+        self.process_frame(frame_data).await
+    }
+
+    /// Drive the state machine with one already-deframed payload. Separating this
+    /// from the TCP read lets a non-TCP transport (BLE L2CAP) reuse the identical
+    /// connection / UKEY2 / consent / transfer logic.
+    pub async fn process_frame(&mut self, frame_data: Vec<u8>) -> Result<(), anyhow::Error> {
+        // First frame after a WiFi upgrade: a PLAINTEXT CLIENT_INTRODUCTION. Ack
+        // it in plaintext; the encrypted session (same keys/seq) resumes after.
+        if self.awaiting_introduction {
+            self.awaiting_introduction = false;
+            use crate::location_nearby_connections as lnc;
+            use lnc::bandwidth_upgrade_negotiation_frame as bwu;
+            debug!("BWU: received introduction on WiFi channel; sending plaintext ACK");
+            let ack = OfflineFrame {
+                version: Some(lnc::offline_frame::Version::V1.into()),
+                v1: Some(lnc::V1Frame {
+                    r#type: Some(lnc::v1_frame::FrameType::BandwidthUpgradeNegotiation.into()),
+                    bandwidth_upgrade_negotiation: Some(lnc::BandwidthUpgradeNegotiationFrame {
+                        event_type: Some(bwu::EventType::ClientIntroductionAck.into()),
+                        client_introduction_ack: Some(bwu::ClientIntroductionAck {}),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+            };
+            self.send_frame(ack.encode_to_vec()).await?;
+
+            // Now that we're on WiFi, kick off the deferred sharing protocol.
+            if self.wifi_upgrade_pending {
+                self.wifi_upgrade_pending = false;
+                self.send_paired_key_encryption().await?;
+            }
+            return Ok(());
+        }
+
         let current_state = &self.state;
         // Now determine what will be the request type based on current state
         match current_state.state {
@@ -208,7 +435,7 @@ impl InboundRequest {
                 .await;
             }
             _ => {
-                debug!("Handling SecureMessage frame");
+                trace!("Handling SecureMessage frame");
                 let smsg = SecureMessage::decode(&*frame_data)?;
                 self.decrypt_and_process_secure_message(&smsg).await?;
             }
@@ -446,6 +673,17 @@ impl InboundRequest {
 
         self.send_frame(response.encode_to_vec()).await?;
 
+        // When a WiFi upgrade is pending, DON'T start the sharing protocol yet —
+        // otherwise the phone replies on the L2CAP channel we're about to abandon,
+        // and its sequence counter races ahead of ours. Send it after the upgrade.
+        if !self.wifi_upgrade_pending {
+            self.send_paired_key_encryption().await?;
+        }
+
+        Ok(())
+    }
+
+    async fn send_paired_key_encryption(&mut self) -> Result<(), anyhow::Error> {
         let paired_encryption = sharing_nearby::Frame {
             version: Some(sharing_nearby::frame::Version::V1.into()),
             v1: Some(sharing_nearby::V1Frame {
@@ -459,9 +697,7 @@ impl InboundRequest {
             }),
         };
 
-        self.send_encrypted_frame(&paired_encryption).await?;
-
-        Ok(())
+        self.send_encrypted_frame(&paired_encryption).await
     }
 
     async fn decrypt_and_process_secure_message(
@@ -491,15 +727,27 @@ impl InboundRequest {
         let d2d_msg = DeviceToDeviceMessage::decode(&*decrypted)?;
 
         let seq = self.get_client_seq_inc().await;
-        if d2d_msg.sequence_number() != seq {
+        let recv_seq = d2d_msg.sequence_number();
+        // Decode the frame BEFORE the seq check so the trace shows the frame type
+        // (critical for diagnosing the medium-switch channel drain).
+        let offline = location_nearby_connections::OfflineFrame::decode(d2d_msg.message())?;
+        let rx_type = offline.v1.as_ref().and_then(|v| v.r#type).unwrap_or(0);
+        let rx_bwu = offline
+            .v1
+            .as_ref()
+            .and_then(|v| v.bandwidth_upgrade_negotiation.as_ref())
+            .and_then(|b| b.event_type);
+        trace!("RX d2d seq={recv_seq} (expect {seq}) frametype={rx_type} bwu_event={rx_bwu:?}");
+        if recv_seq != seq {
             return Err(anyhow!(
-                "Error d2d_msg.sequence_number invalid ({} vs {})",
-                d2d_msg.sequence_number(),
-                seq
+                "Error d2d_msg.sequence_number invalid ({} vs {}) frametype={} bwu_event={:?}",
+                recv_seq,
+                seq,
+                rx_type,
+                rx_bwu
             ));
         }
 
-        let offline = location_nearby_connections::OfflineFrame::decode(d2d_msg.message())?;
         let v1_frame = offline
             .v1
             .as_ref()
@@ -523,7 +771,7 @@ impl InboundRequest {
 
                 match header.r#type() {
                     payload_header::PayloadType::Bytes => {
-                        info!("Processing PayloadType::Bytes");
+                        trace!("Processing PayloadType::Bytes");
                         let payload_id = header.id();
 
                         if header.total_size() > SANE_FRAME_LENGTH.into() {
@@ -556,7 +804,7 @@ impl InboundRequest {
                         }
 
                         if (chunk.flags() & 1) == 1 {
-                            debug!("Chunk flags & 1 == 1 ?? End of data ??");
+                            trace!("Chunk flags & 1 == 1 ?? End of data ??");
 
                             if self.state.text_payload.is_some()
                                 && self.state.text_payload.as_ref().unwrap().get_i64_value()
@@ -624,7 +872,7 @@ impl InboundRequest {
                         }
                     }
                     payload_header::PayloadType::File => {
-                        info!("Processing PayloadType::File");
+                        trace!("Processing PayloadType::File");
                         let payload_id = header.id();
 
                         let file_internal = self
@@ -698,6 +946,52 @@ impl InboundRequest {
             location_nearby_connections::v1_frame::FrameType::KeepAlive => {
                 trace!("Sending keepalive");
                 self.send_keepalive(true).await?;
+            }
+            location_nearby_connections::v1_frame::FrameType::BandwidthUpgradeNegotiation => {
+                use crate::location_nearby_connections::bandwidth_upgrade_negotiation_frame as bwu;
+                let event = v1_frame
+                    .bandwidth_upgrade_negotiation
+                    .as_ref()
+                    .and_then(|b| b.event_type)
+                    .unwrap_or(0);
+                if event == bwu::EventType::ClientIntroduction as i32 {
+                    debug!("BWU: received CLIENT_INTRODUCTION; sending ACK");
+                    use crate::location_nearby_connections as lnc;
+                    let ack = OfflineFrame {
+                        version: Some(lnc::offline_frame::Version::V1.into()),
+                        v1: Some(lnc::V1Frame {
+                            r#type: Some(lnc::v1_frame::FrameType::BandwidthUpgradeNegotiation.into()),
+                            bandwidth_upgrade_negotiation: Some(lnc::BandwidthUpgradeNegotiationFrame {
+                                event_type: Some(bwu::EventType::ClientIntroductionAck.into()),
+                                client_introduction_ack: Some(bwu::ClientIntroductionAck {}),
+                                ..Default::default()
+                            }),
+                            ..Default::default()
+                        }),
+                    };
+                    self.encrypt_and_send(&ack).await?;
+                } else if event == bwu::EventType::UpgradeFailure as i32 {
+                    // Phone declined our WiFi offer. Dump the echoed frame (reveals
+                    // the medium) and flag it so the driver reacts immediately.
+                    info!(
+                        "BWU: UPGRADE_FAILURE; frame = {:?}",
+                        v1_frame.bandwidth_upgrade_negotiation
+                    );
+                    self.upgrade_rejected = true;
+                } else if event == bwu::EventType::LastWriteToPriorChannel as i32 {
+                    // Phone's final frame on the old (L2CAP) channel — now safe to
+                    // switch to WiFi without losing an inbound d2d frame.
+                    debug!("BWU: LAST_WRITE_TO_PRIOR_CHANNEL");
+                    self.prior_channel_drained = true;
+                } else {
+                    debug!("BWU: received event {event}");
+                }
+            }
+            location_nearby_connections::v1_frame::FrameType::BandwidthUpgradeRetry => {
+                // The phone's WiFi just recovered and it wants the upgrade again.
+                // Flag it; the L2CAP driver re-offers WIFI_LAN.
+                debug!("BWU: phone requested upgrade retry (WiFi recovered)");
+                self.wifi_retry_requested = true;
             }
             _ => {
                 error!("Unhandled offline frame encrypted: {:?}", offline);
@@ -1215,8 +1509,16 @@ impl InboundRequest {
     }
 
     async fn encrypt_and_send(&mut self, frame: &OfflineFrame) -> Result<(), anyhow::Error> {
+        let tx_seq = self.get_server_seq_inc().await;
+        let tx_type = frame.v1.as_ref().and_then(|v| v.r#type).unwrap_or(0);
+        let tx_bwu = frame
+            .v1
+            .as_ref()
+            .and_then(|v| v.bandwidth_upgrade_negotiation.as_ref())
+            .and_then(|b| b.event_type);
+        trace!("TX d2d seq={tx_seq} frametype={tx_type} bwu_event={tx_bwu:?}");
         let d2d_msg = DeviceToDeviceMessage {
-            sequence_number: Some(self.get_server_seq_inc().await),
+            sequence_number: Some(tx_seq),
             message: Some(frame.encode_to_vec()),
         };
 

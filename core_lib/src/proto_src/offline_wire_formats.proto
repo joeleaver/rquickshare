@@ -43,6 +43,13 @@ message V1Frame {
     KEEP_ALIVE = 5;
     DISCONNECTION = 6;
     PAIRED_KEY_ENCRYPTION = 7;
+    AUTHENTICATION_MESSAGE = 8;
+    AUTHENTICATION_RESULT = 9;
+    AUTO_RESUME = 10;
+    AUTO_RECONNECT = 11;
+    // Sent by the remote device when it (re)gains a usable WiFi network and wants
+    // us to re-offer the bandwidth upgrade. Carries the now-supported mediums.
+    BANDWIDTH_UPGRADE_RETRY = 12;
   }
   optional FrameType type = 1;
 
@@ -181,6 +188,14 @@ message PayloadTransferFrame {
   optional ControlMessage control_message = 4;
 }
 
+message ServiceAddress {
+  // This can be either IPv4 or IPv6 address.
+  // IPv4 addresses are 4 bytes long, IPv6 addresses are 16 bytes long.
+  // Anything other than 4 or 16 bytes is invalid. MSB-first order.
+  optional bytes ip_address = 1;
+  optional int32 port = 2;
+}
+
 message BandwidthUpgradeNegotiationFrame {
   enum EventType {
     UNKNOWN_EVENT_TYPE = 0;
@@ -224,6 +239,12 @@ message BandwidthUpgradeNegotiationFrame {
     message WifiLanSocket {
       optional bytes ip_address = 1;
       optional int32 wifi_port = 2;
+      // Replaces ip_address/wifi_port for new clients. Modern Quick Share
+      // RECEIVERS ignore the legacy fields when this is set and connect to each
+      // candidate in order. Pixel firmware rejects an offer with no candidates,
+      // so we must populate this. Senders still set ip_address/wifi_port to the
+      // last item's value for backward compat.
+      repeated ServiceAddress address_candidates = 3;
     }
 
     // Accompanies Medium.BLUETOOTH.

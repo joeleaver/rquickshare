@@ -8,6 +8,8 @@ use anyhow::anyhow;
 use channel::ChannelMessage;
 #[cfg(all(feature = "experimental", target_os = "linux"))]
 use hdl::BleAdvertiser;
+#[cfg(all(feature = "experimental", target_os = "linux"))]
+use hdl::BleConnectionsAdvertiser;
 use hdl::MDnsDiscovery;
 use once_cell::sync::Lazy;
 use rand::distr::Alphanumeric;
@@ -112,11 +114,31 @@ impl RQS {
         self.tracker = Some(tracker.clone());
         self.ctoken = Some(ctoken.clone());
 
-        let endpoint_id: Vec<u8> = rand::rng()
-            .sample_iter(Alphanumeric)
-            .take(4)
-            .map(u8::from)
-            .collect();
+        // Stable per-machine endpoint_id so app restarts don't leave ghost
+        // entries on the sender's device. Falls back to random.
+        //
+        // QS_RANDOM_ENDPOINT=1 forces a fresh random endpoint_id each launch — used
+        // to test whether the phone keeps a per-endpoint negative cache that refuses
+        // the WiFi bandwidth upgrade after our earlier broken upgrades to this stable
+        // endpoint_id failed (see memory [[quickshare-wifi-upgrade-research]]).
+        let random_endpoint = || -> Vec<u8> {
+            rand::rng()
+                .sample_iter(Alphanumeric)
+                .take(4)
+                .map(u8::from)
+                .collect()
+        };
+        let endpoint_id: Vec<u8> = if std::env::var_os("QS_RANDOM_ENDPOINT").is_some() {
+            let id = random_endpoint();
+            info!("QS_RANDOM_ENDPOINT set; using random endpoint_id {id:?}");
+            id
+        } else {
+            std::fs::read_to_string("/etc/machine-id")
+                .ok()
+                .map(|s| s.trim().bytes().take(4).collect::<Vec<u8>>())
+                .filter(|v| v.len() == 4)
+                .unwrap_or_else(random_endpoint)
+        };
         let tcp_listener =
             TcpListener::bind(format!("0.0.0.0:{}", self.port_number.unwrap_or(0))).await?;
         let binded_addr = tcp_listener.local_addr()?;
@@ -153,6 +175,50 @@ impl RQS {
         )?;
         let ctk = ctoken.clone();
         tracker.spawn(async move { mdns.run(ctk).await });
+
+        // Advertise as a discoverable Quick Share RECEIVER over BLE (0xFEF3).
+        //
+        // ON BY DEFAULT (2026-06-18). This runs the L2CAP CoC server + BLE advert
+        // so the phone can discover us over Bluetooth and bandwidth-upgrade to
+        // WiFi-LAN (reliable discovery + WiFi speed, and works when mDNS discovery
+        // fails). The historical "advert is harmful" failure (phone tried a BT
+        // transport we didn't serve) is gone now that we serve L2CAP and complete
+        // the WiFi upgrade. mDNS still works in parallel. Opt out with
+        // QS_NO_BLE_ADVERT=1 to fall back to pure mDNS+TCP (NearDrop-style).
+        #[cfg(all(feature = "experimental", target_os = "linux"))]
+        if std::env::var_os("QS_NO_BLE_ADVERT").is_none() {
+            let eid: [u8; 4] = endpoint_id[..4].try_into()?;
+            let device_name =
+                sys_metrics::host::get_hostname().unwrap_or_else(|_| "rquickshare".to_string());
+
+            // Inner BleAdvertisement built ONCE and shared so the advert header's
+            // hash matches what the L2CAP server returns for REQUEST_ADVERTISEMENT.
+            let psm = hdl::L2CAP_PSM;
+            let inner = hdl::build_inner_advertisement(eid, &device_name, psm);
+
+            // L2CAP CoC server for the BLE transport, advertised via the PSM
+            // above so the phone will attempt an L2CAP connection.
+            let ctk = ctoken.clone();
+            let inner_l2 = inner.clone();
+            let l2_sender = self.message_sender.clone();
+            tracker.spawn(async move {
+                if let Err(e) = hdl::L2capServer::new(psm, inner_l2, l2_sender).run(ctk).await {
+                    error!("L2capServer error: {e}");
+                }
+            });
+
+            match BleConnectionsAdvertiser::new(eid, device_name, psm, inner).await {
+                Ok(adv) => {
+                    let ctk = ctoken.clone();
+                    tracker.spawn(async move {
+                        if let Err(e) = adv.run(ctk).await {
+                            error!("BleConnectionsAdvertiser error: {e}");
+                        }
+                    });
+                }
+                Err(e) => error!("Couldn't init BleConnectionsAdvertiser: {e}"),
+            }
+        }
 
         tracker.close();
 

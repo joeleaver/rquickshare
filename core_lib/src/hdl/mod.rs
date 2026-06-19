@@ -16,6 +16,18 @@ pub use ble::*;
 mod blea;
 #[cfg(all(feature = "experimental", target_os = "linux"))]
 pub use blea::*;
+#[cfg(all(feature = "experimental", target_os = "linux"))]
+mod blea2;
+#[cfg(all(feature = "experimental", target_os = "linux"))]
+pub use blea2::*;
+#[cfg(all(feature = "experimental", target_os = "linux"))]
+mod ble_header;
+#[cfg(all(feature = "experimental", target_os = "linux"))]
+pub use ble_header::*;
+#[cfg(all(feature = "experimental", target_os = "linux"))]
+mod l2cap;
+#[cfg(all(feature = "experimental", target_os = "linux"))]
+pub use l2cap::*;
 mod inbound;
 pub use inbound::*;
 pub(crate) mod info;
