@@ -25,6 +25,10 @@ mod ble_header;
 #[cfg(all(feature = "experimental", target_os = "linux"))]
 pub use ble_header::*;
 #[cfg(all(feature = "experimental", target_os = "linux"))]
+mod ble_discovery;
+#[cfg(all(feature = "experimental", target_os = "linux"))]
+pub use ble_discovery::*;
+#[cfg(all(feature = "experimental", target_os = "linux"))]
 mod l2cap;
 #[cfg(all(feature = "experimental", target_os = "linux"))]
 pub use l2cap::*;
