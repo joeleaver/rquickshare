@@ -68,6 +68,9 @@ pub struct OutboundRequest {
     sender: Sender<ChannelMessage>,
     receiver: Receiver<ChannelMessage>,
     payload: OutboundPayload,
+    // Carries partial inbound frames across the non-blocking drains we do
+    // between payload chunks (see `drain_incoming`).
+    recv_buf: Vec<u8>,
 }
 
 impl OutboundRequest {
@@ -102,6 +105,7 @@ impl OutboundRequest {
             sender,
             receiver,
             payload,
+            recv_buf: Vec::new(),
         }
     }
 
@@ -212,6 +216,53 @@ impl OutboundRequest {
                 let smsg = SecureMessage::decode(&*frame_data)?;
                 self.decrypt_and_process_secure_message(&smsg).await?;
             }
+        }
+
+        Ok(())
+    }
+
+    /// Non-blocking, cancel-safe servicing of the socket between payload chunks.
+    /// Reads whatever the receiver has sent and dispatches each complete frame
+    /// (KEEP_ALIVE → reply, bandwidth-upgrade/cancel → handled) so a long send
+    /// doesn't deadlock on a full TCP window while the peer waits on us.
+    async fn drain_incoming(&mut self) -> Result<(), anyhow::Error> {
+        // Pull all immediately-available bytes. `try_read` reads only what's
+        // already buffered (or WouldBlock), so it never stalls the send.
+        loop {
+            let mut tmp = [0u8; 16 * 1024];
+            match self.socket.try_read(&mut tmp) {
+                Ok(0) => return Err(anyhow!("connection closed by peer during send")),
+                Ok(n) => self.recv_buf.extend_from_slice(&tmp[..n]),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(e) => return Err(e.into()),
+            }
+        }
+
+        // Dispatch every complete [4-byte BE length][payload] frame we've buffered.
+        // During the payload phase the peer's frames are encrypted SecureMessages.
+        loop {
+            if self.recv_buf.len() < 4 {
+                break;
+            }
+            let len = u32::from_be_bytes([
+                self.recv_buf[0],
+                self.recv_buf[1],
+                self.recv_buf[2],
+                self.recv_buf[3],
+            ]) as usize;
+            if len > SANE_FRAME_LENGTH as usize {
+                return Err(anyhow!("incoming frame too large ({len})"));
+            }
+            if self.recv_buf.len() < 4 + len {
+                break;
+            }
+            let frame = self.recv_buf[4..4 + len].to_vec();
+            self.recv_buf.drain(..4 + len);
+
+            let smsg = SecureMessage::decode(&*frame)?;
+            // Boxed: this dispatch can re-enter the payload loop (which calls us),
+            // so break the static async-recursion cycle.
+            Box::pin(self.decrypt_and_process_secure_message(&smsg)).await?;
         }
 
         Ok(())
@@ -871,6 +922,13 @@ impl OutboundRequest {
                             true,
                         )
                         .await;
+
+                        // Service the receiver between chunks: answer its KEEP_ALIVE
+                        // and drain any control frames. Without this we never read
+                        // the socket mid-transfer, the peer's keepalives go
+                        // unanswered, it stops reading, our TCP window fills, and the
+                        // send deadlocks (observed: a 100MB send froze ~58MB in).
+                        self.drain_incoming().await?;
 
                         // If we just sent the last bytes of the file, mark it as finished
                         if curr_state.bytes_transferred + bytes_read as i64 == curr_state.total_size
