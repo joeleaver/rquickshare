@@ -9,7 +9,7 @@
 // validated by round-tripping against those builders (see tests) — no packet
 // captures required.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use anyhow::anyhow;
 use bluer::{Adapter, AdapterEvent, Address, Device, DiscoveryFilter, DiscoveryTransport, UuidExt};
@@ -180,6 +180,10 @@ impl BleDiscovery {
         // addr -> advert hash we last emitted, so the flood of property-change
         // re-fires doesn't reconnect + re-GATT-read the same advertisement.
         let mut emitted: HashMap<Address, [u8; 4]> = HashMap::new();
+        // Addresses fully resolved over GATT: never reconnect to them again (a
+        // reconnect storm during a Wi-Fi transfer starves the 2.4GHz radio and
+        // stalls it). They stay listed until the device leaves.
+        let mut resolved: HashSet<Address> = HashSet::new();
 
         loop {
             tokio::select! {
@@ -190,11 +194,12 @@ impl BleDiscovery {
                 ev = events.next() => {
                     match ev {
                         Some(AdapterEvent::DeviceAdded(addr)) => {
-                            if let Err(e) = self.on_device(addr, &mut emitted).await {
+                            if let Err(e) = self.on_device(addr, &mut emitted, &mut resolved).await {
                                 debug!("{INNER_NAME}: {addr}: {e}");
                             }
                         }
                         Some(AdapterEvent::DeviceRemoved(addr)) => {
+                            resolved.remove(&addr);
                             if emitted.remove(&addr).is_some() {
                                 info!("{INNER_NAME}: {addr} left");
                                 let _ = self.sender.send(EndpointInfo {
@@ -221,7 +226,13 @@ impl BleDiscovery {
         &self,
         addr: Address,
         emitted: &mut HashMap<Address, [u8; 4]>,
+        resolved: &mut HashSet<Address>,
     ) -> Result<(), anyhow::Error> {
+        // Already fully resolved over GATT — it's listed; don't reconnect.
+        if resolved.contains(&addr) {
+            return Ok(());
+        }
+
         let device = self.adapter.device(addr)?;
         let svc = Uuid::from_u16(NEARBY_PRESENCE_UUID);
 
@@ -288,6 +299,12 @@ impl BleDiscovery {
         info!("{INNER_NAME}: discovered receiver {ei:?}");
         let _ = self.sender.send(ei);
         emitted.insert(addr, header.advertisement_hash);
+        // A clean GATT read means we have everything we'll ever need from this
+        // device; stop reconnecting to it. A fallback (alias) stays retryable so
+        // a later advert can still upgrade it to the real name.
+        if endpoint.is_some() {
+            resolved.insert(addr);
+        }
         Ok(())
     }
 
