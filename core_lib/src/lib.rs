@@ -10,6 +10,8 @@ use channel::ChannelMessage;
 use hdl::BleAdvertiser;
 #[cfg(all(feature = "experimental", target_os = "linux"))]
 use hdl::BleConnectionsAdvertiser;
+#[cfg(all(feature = "experimental", target_os = "linux"))]
+use hdl::BleDiscovery;
 use hdl::MDnsDiscovery;
 use once_cell::sync::Lazy;
 use rand::distr::Alphanumeric;
@@ -251,6 +253,22 @@ impl RQS {
 
                 if let Err(e) = blea.run(ctk_blea).await {
                     error!("Couldn't start BleAdvertiser: {}", e);
+                }
+            });
+
+            // Scan BLE for phones that are only "visible to everyone" (Nearby
+            // Presence 0xFEF3, no mDNS) and feed them into the same discovery
+            // stream so they appear alongside the mDNS/WiFi endpoints.
+            let ctk_bd = ctk.clone();
+            let bd_sender = sender.clone();
+            tracker.spawn(async move {
+                match BleDiscovery::new(bd_sender).await {
+                    Ok(bd) => {
+                        if let Err(e) = bd.run(ctk_bd).await {
+                            error!("Couldn't start BleDiscovery: {}", e);
+                        }
+                    }
+                    Err(e) => error!("Couldn't init BleDiscovery: {}", e),
                 }
             });
         }

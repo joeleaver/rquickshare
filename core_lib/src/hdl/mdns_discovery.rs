@@ -20,6 +20,12 @@ pub struct EndpointInfo {
     pub port: Option<String>,
     pub rtype: Option<DeviceType>,
     pub present: Option<bool>,
+    /// BLE-discovered receiver: its Bluetooth address (for opening an L2CAP CoC).
+    /// `None` for mDNS / WiFi-LAN endpoints, which carry ip+port instead.
+    pub bt_address: Option<String>,
+    /// BLE L2CAP PSM advertised by a "visible to everyone" receiver. `None` for
+    /// mDNS / WiFi-LAN endpoints.
+    pub psm: Option<u16>,
 }
 
 pub struct MDnsDiscovery {
@@ -94,6 +100,8 @@ impl MDnsDiscovery {
                                             port: Some(port.to_string()),
                                             rtype: Some(dt),
                                             present: Some(true),
+                                            bt_address: None,
+                                            psm: None,
                                         };
                                         info!("ServiceResolved: Resolved a new service: {:?}", ei);
                                         cache.insert(fullname.clone(), ei.clone());

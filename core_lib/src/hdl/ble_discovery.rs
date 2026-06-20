@@ -9,8 +9,21 @@
 // validated by round-tripping against those builders (see tests) — no packet
 // captures required.
 
-use super::blea2::build_inner_advertisement;
-use super::build_advertisement_header;
+use std::collections::HashMap;
+
+use anyhow::anyhow;
+use bluer::{Adapter, AdapterEvent, Address, Device, DiscoveryFilter, DiscoveryTransport, UuidExt};
+use futures::{pin_mut, StreamExt};
+use tokio::sync::broadcast;
+use tokio::time::{timeout, Duration};
+use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
+
+use super::{advertisement_uuid, EndpointInfo};
+use crate::DeviceType;
+
+const NEARBY_PRESENCE_UUID: u16 = 0xFEF3;
+const INNER_NAME: &str = "BleDiscovery";
 
 /// Parsed 0xFEF3 advertisement header (see `build_advertisement_header`):
 /// `[ver<<5|ext<<4|slots][bloom(10)][hash(4)][psm(2)]`.
@@ -116,9 +129,236 @@ fn parse_endpoint_info(ei: &[u8]) -> Option<(String, u8)> {
     Some((String::from_utf8_lossy(name).to_string(), device_type))
 }
 
+/// Stable discovery id for a BLE endpoint (the Bluetooth address is stable; the
+/// Nearby endpoint_id and advert hash rotate). beamish keys its device list on
+/// this and uses the `ble:` prefix to route a send over L2CAP instead of TCP.
+#[inline]
+fn ble_id(addr: Address) -> String {
+    format!("ble:{addr}")
+}
+
+/// Scans for "visible to everyone" Quick Share receivers (Nearby Presence
+/// service 0xFEF3) and emits them into `discovery()`'s `EndpointInfo` stream.
+///
+/// This is the runtime counterpart to the parsers above: scan 0xFEF3 → parse the
+/// advertisement header (PSM + dedup hash) → GATT-read the inner BleAdvertisement
+/// → `parse_inner_advertisement` (endpoint name + type + L2CAP PSM) → emit an
+/// `EndpointInfo` that carries the Bluetooth address + PSM but no ip/port.
+pub struct BleDiscovery {
+    adapter: Adapter,
+    sender: broadcast::Sender<EndpointInfo>,
+}
+
+impl BleDiscovery {
+    pub async fn new(sender: broadcast::Sender<EndpointInfo>) -> Result<Self, anyhow::Error> {
+        let session = bluer::Session::new().await?;
+        let adapter = session.default_adapter().await?;
+        adapter.set_powered(true).await?;
+        Ok(Self { adapter, sender })
+    }
+
+    pub async fn run(self, ctk: CancellationToken) -> Result<(), anyhow::Error> {
+        let svc = Uuid::from_u16(NEARBY_PRESENCE_UUID);
+
+        // Surface only devices advertising Nearby Presence, and keep advert
+        // refreshes coming (`duplicate_data`) so service data that lands after
+        // the first DeviceAdded is delivered as further DeviceAdded re-fires.
+        let filter = DiscoveryFilter {
+            uuids: [svc].into_iter().collect(),
+            transport: DiscoveryTransport::Le,
+            duplicate_data: true,
+            ..Default::default()
+        };
+        if let Err(e) = self.adapter.set_discovery_filter(filter).await {
+            warn!("{INNER_NAME}: couldn't set discovery filter ({e}); scanning unfiltered");
+        }
+
+        info!("{INNER_NAME}: scanning for Quick Share receivers (service {svc})");
+        let events = self.adapter.discover_devices_with_changes().await?;
+        pin_mut!(events);
+
+        // addr -> advert hash we last emitted, so the flood of property-change
+        // re-fires doesn't reconnect + re-GATT-read the same advertisement.
+        let mut emitted: HashMap<Address, [u8; 4]> = HashMap::new();
+
+        loop {
+            tokio::select! {
+                _ = ctk.cancelled() => {
+                    info!("{INNER_NAME}: cancelled, stopping scan");
+                    break;
+                }
+                ev = events.next() => {
+                    match ev {
+                        Some(AdapterEvent::DeviceAdded(addr)) => {
+                            if let Err(e) = self.on_device(addr, &mut emitted).await {
+                                debug!("{INNER_NAME}: {addr}: {e}");
+                            }
+                        }
+                        Some(AdapterEvent::DeviceRemoved(addr)) => {
+                            if emitted.remove(&addr).is_some() {
+                                info!("{INNER_NAME}: {addr} left");
+                                let _ = self.sender.send(EndpointInfo {
+                                    id: ble_id(addr),
+                                    present: Some(false),
+                                    ..Default::default()
+                                });
+                            }
+                        }
+                        Some(_) => {}
+                        None => {
+                            info!("{INNER_NAME}: device stream ended");
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn on_device(
+        &self,
+        addr: Address,
+        emitted: &mut HashMap<Address, [u8; 4]>,
+    ) -> Result<(), anyhow::Error> {
+        let device = self.adapter.device(addr)?;
+        let svc = Uuid::from_u16(NEARBY_PRESENCE_UUID);
+
+        // The 0xFEF3 service data is the advertisement HEADER (bloom + hash + PSM).
+        let header_bytes = match device.service_data().await? {
+            Some(sd) => match sd.get(&svc) {
+                Some(b) => b.clone(),
+                None => return Ok(()),
+            },
+            None => return Ok(()),
+        };
+        let header = match parse_advertisement_header(&header_bytes) {
+            Some(h) => h,
+            None => return Ok(()),
+        };
+
+        // Already processed this exact advert? Skip the GATT round-trip.
+        if emitted.get(&addr) == Some(&header.advertisement_hash) {
+            return Ok(());
+        }
+
+        // Recover the inner advert (endpoint name + type + PSM) over GATT. If the
+        // receiver serves it over L2CAP instead (some do), fall back to the
+        // device's Bluetooth alias so it still appears with a usable label.
+        let endpoint = match self.read_inner(&device, header.num_slots).await {
+            Ok(bytes) => parse_inner_advertisement(&bytes),
+            Err(e) => {
+                debug!("{INNER_NAME}: {addr}: GATT inner-advert read failed ({e})");
+                None
+            }
+        };
+
+        let (name, rtype, inner_psm) = match &endpoint {
+            Some(d) => (
+                d.device_name.clone(),
+                Some(DeviceType::from_raw_value(d.device_type)),
+                d.psm,
+            ),
+            None => (
+                device.alias().await.unwrap_or_default(),
+                Some(DeviceType::Phone),
+                0,
+            ),
+        };
+        // Prefer the inner-advert PSM; fall back to the header's.
+        let psm = if inner_psm != 0 { inner_psm } else { header.psm.unwrap_or(0) };
+        let name = if name.trim().is_empty() {
+            format!("Nearby device ({addr})")
+        } else {
+            name
+        };
+
+        let ei = EndpointInfo {
+            fullname: ble_id(addr),
+            id: ble_id(addr),
+            name: Some(name),
+            ip: None,
+            port: None,
+            rtype,
+            present: Some(true),
+            bt_address: Some(addr.to_string()),
+            psm: if psm != 0 { Some(psm) } else { None },
+        };
+        info!("{INNER_NAME}: discovered receiver {ei:?}");
+        let _ = self.sender.send(ei);
+        emitted.insert(addr, header.advertisement_hash);
+        Ok(())
+    }
+
+    /// GATT-read the inner BleAdvertisement from the 0xFEF3 service. Connects if
+    /// needed, and disconnects afterward only if we opened the connection.
+    async fn read_inner(&self, device: &Device, num_slots: u8) -> Result<Vec<u8>, anyhow::Error> {
+        let we_connected = if !device.is_connected().await? {
+            timeout(Duration::from_secs(10), device.connect())
+                .await
+                .map_err(|_| anyhow!("connect timed out"))??;
+            true
+        } else {
+            false
+        };
+
+        // BlueZ resolves the GATT database a moment after connecting; reading
+        // characteristics before that yields an empty service list.
+        let resolved = timeout(Duration::from_secs(10), async {
+            while !device.is_services_resolved().await.unwrap_or(false) {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        })
+        .await;
+        if resolved.is_err() {
+            debug!("{INNER_NAME}: services not resolved in time, reading anyway");
+        }
+
+        let result = self.read_inner_chars(device, num_slots).await;
+
+        if we_connected {
+            let _ = device.disconnect().await;
+        }
+        result
+    }
+
+    async fn read_inner_chars(
+        &self,
+        device: &Device,
+        num_slots: u8,
+    ) -> Result<Vec<u8>, anyhow::Error> {
+        let svc_uuid = Uuid::from_u16(NEARBY_PRESENCE_UUID);
+        let services = timeout(Duration::from_secs(10), device.services())
+            .await
+            .map_err(|_| anyhow!("service discovery timed out"))??;
+
+        for svc in services {
+            if svc.uuid().await? != svc_uuid {
+                continue;
+            }
+            // The advert lives in the characteristic whose UUID is the slot base
+            // OR'd with the slot index; try each advertised slot, else the first
+            // characteristic in the service.
+            let chars = svc.characteristics().await?;
+            let wanted: Vec<Uuid> = (0..=num_slots.max(1)).map(advertisement_uuid).collect();
+            for ch in &chars {
+                if wanted.contains(&ch.uuid().await?) {
+                    return Ok(ch.read().await?);
+                }
+            }
+            if let Some(ch) = chars.first() {
+                return Ok(ch.read().await?);
+            }
+        }
+        Err(anyhow!("0xFEF3 advertisement characteristic not found"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hdl::{build_advertisement_header, build_inner_advertisement};
 
     #[test]
     fn header_roundtrip() {
