@@ -242,6 +242,20 @@ async fn handle(
     // sharing handshake ORDER (it sent our PairedKeyEncryption after our
     // PairedKeyResult), so the phone stalled and disconnected. We no longer defer.
 
+    // QS_BWU_ACTOR (experimental): route the receive-path WiFi upgrade through
+    // nearby-rs's BwuActor + StreamChannel (the EndpointChannelBridge in
+    // hdl::bwu_channel) instead of this inline path. Unset = the proven default,
+    // which is Pixel-validated. The routing lands incrementally (see
+    // .bwu-integration-design.md "StreamChannel-adoption inversion"); Inc 0 only
+    // reads and announces the flag, so behaviour is unchanged either way for now.
+    let use_actor = std::env::var("QS_BWU_ACTOR").is_ok();
+    if use_actor {
+        warn!(
+            "{INNER_NAME}: QS_BWU_ACTOR set — BwuActor receive-path routing is not wired yet; \
+             falling back to the inline upgrade path"
+        );
+    }
+
     // WiFi bandwidth-upgrade state. After the NC connection is accepted we offer a
     // WIFI_LAN upgrade and bind an ephemeral TCP listener, then race:
     //   * the phone connects over TCP        -> swap transport to WiFi (fast path)
