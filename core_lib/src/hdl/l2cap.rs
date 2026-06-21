@@ -21,12 +21,16 @@ use std::sync::Arc;
 
 use bluer::l2cap::{SocketAddr, Stream, StreamListener};
 use bluer::{Address, AddressType};
+use nearby_rs::bwu::EndpointChannel;
+use nearby_rs::mediums::Medium;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::broadcast::Sender;
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::channel::ChannelMessage;
 
+use super::bwu_channel::EndpointChannelBridge;
 use super::{InboundRequest, State, Transport};
 
 const INNER_NAME: &str = "L2capServer";
@@ -234,6 +238,61 @@ async fn handle(
         }
     });
 
+    // QS_BWU_ACTOR (experimental): route the receive path through nearby-rs's
+    // StreamChannel (an EndpointChannelBridge over `proto`) so framing + d2d crypto
+    // + the sequence counters live in the shared channel — the foundation for
+    // driving the WiFi upgrade through the BwuActor. Unset = the proven inline path
+    // (Pixel-validated). Inc 1 routes the DATA path only (no WiFi offer); the actor
+    // + upgrade routing are Inc 2. See .bwu-integration-design.md.
+    let use_actor = std::env::var("QS_BWU_ACTOR").is_ok();
+    if use_actor {
+        warn!(
+            "{INNER_NAME}: QS_BWU_ACTOR set — routing the receive path through the \
+             StreamChannel (Inc 1: data path, no WiFi upgrade)"
+        );
+        // The channel owns `proto`; a dedicated blocking reader drains it (deframe +
+        // decrypt once the cipher is installed) into an mpsc the async loop selects,
+        // so a frame is never lost to select cancellation. t_in/t_out still bridge
+        // L2CAP <-> `proto`, with the channel pumps sitting on the `proto` end.
+        let ecb = EndpointChannelBridge::new_plaintext(proto, "beamish", Medium::BleL2cap);
+        let channel: Arc<dyn EndpointChannel> = ecb.channel.clone();
+        let (frame_tx, mut frame_rx) = mpsc::channel::<Vec<u8>>(64);
+        let reader_chan = channel.clone();
+        std::thread::spawn(move || loop {
+            match reader_chan.read() {
+                Ok(bytes) => {
+                    if frame_tx.blocking_send(bytes).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break, // channel closed / transport gone
+            }
+        });
+
+        // InboundRequest reads via the channel reader and writes via the channel, so
+        // its own socket is inert — give it a throwaway duplex half.
+        let (dummy, _dummy_peer) = tokio::io::duplex(8);
+        let mut ir = InboundRequest::new(Transport::Duplex(dummy), id, sender);
+        ir.set_channel(channel);
+
+        // Data-path loop: no WiFi offer (Inc 1). The whole transfer runs over L2CAP
+        // through the StreamChannel.
+        loop {
+            if let Err(e) = ir.handle_via_channel(&mut frame_rx).await {
+                match e.downcast_ref::<crate::errors::AppError>() {
+                    Some(crate::errors::AppError::NotAnError) => {}
+                    _ => debug!("{INNER_NAME}: protocol ended: {e} (state {:?})", ir.state.state),
+                }
+                break;
+            }
+        }
+
+        drop(ecb); // keep the channel pumps alive until the loop ends
+        t_in.abort();
+        t_out.abort();
+        return Ok(());
+    }
+
     // Run the existing receiver state machine over the bridged stream.
     let mut ir = InboundRequest::new(Transport::Duplex(proto), id, sender);
     // NOTE: we used to defer the first sharing frame (PairedKeyEncryption) until
@@ -241,20 +300,6 @@ async fn handle(
     // by the channel drain (drain_prior_channel), and deferring actively breaks the
     // sharing handshake ORDER (it sent our PairedKeyEncryption after our
     // PairedKeyResult), so the phone stalled and disconnected. We no longer defer.
-
-    // QS_BWU_ACTOR (experimental): route the receive-path WiFi upgrade through
-    // nearby-rs's BwuActor + StreamChannel (the EndpointChannelBridge in
-    // hdl::bwu_channel) instead of this inline path. Unset = the proven default,
-    // which is Pixel-validated. The routing lands incrementally (see
-    // .bwu-integration-design.md "StreamChannel-adoption inversion"); Inc 0 only
-    // reads and announces the flag, so behaviour is unchanged either way for now.
-    let use_actor = std::env::var("QS_BWU_ACTOR").is_ok();
-    if use_actor {
-        warn!(
-            "{INNER_NAME}: QS_BWU_ACTOR set — BwuActor receive-path routing is not wired yet; \
-             falling back to the inline upgrade path"
-        );
-    }
 
     // WiFi bandwidth-upgrade state. After the NC connection is accepted we offer a
     // WIFI_LAN upgrade and bind an ephemeral TCP listener, then race:

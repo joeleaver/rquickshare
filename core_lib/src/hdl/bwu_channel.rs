@@ -123,6 +123,31 @@ impl EndpointChannelBridge {
     where
         T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
+        Self::build(transport, Some(session), service_id, medium)
+    }
+
+    /// Build a `StreamChannel` over `transport` with **no** cipher installed —
+    /// reads/writes are plaintext `[4B len][frame]` until a later
+    /// [`EndpointChannel::enable_encryption`](nearby_rs::bwu::EndpointChannel) call
+    /// turns encryption on. Used by the live `QS_BWU_ACTOR` receive path, which
+    /// carries the plaintext UKEY2 handshake on the channel and only installs the
+    /// shared [`UkeySession`] cipher once key derivation completes.
+    pub fn new_plaintext<T>(transport: T, service_id: impl Into<String>, medium: Medium) -> Self
+    where
+        T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        Self::build(transport, None, service_id, medium)
+    }
+
+    fn build<T>(
+        transport: T,
+        session: Option<Arc<UkeySession>>,
+        service_id: impl Into<String>,
+        medium: Medium,
+    ) -> Self
+    where
+        T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
         let (mut rd, mut wr) = tokio::io::split(transport);
         let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel::<Vec<u8>>();
         let bridge = Arc::new(TransportBridge {
@@ -169,7 +194,9 @@ impl EndpointChannelBridge {
         });
 
         let channel = Arc::new(StreamChannel::new(service_id, "bwu", medium, bridge));
-        channel.enable_encryption(session);
+        if let Some(session) = session {
+            channel.enable_encryption(session);
+        }
 
         Self {
             channel,

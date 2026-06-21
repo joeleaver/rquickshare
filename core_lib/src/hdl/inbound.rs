@@ -1,6 +1,10 @@
 use std::fs::File;
 use std::os::unix::fs::FileExt;
+use std::sync::Arc;
 use std::time::Duration;
+
+use nearby_rs::bwu::EndpointChannel;
+use nearby_rs::frames::Exception;
 
 use anyhow::anyhow;
 use bytes::Bytes;
@@ -42,6 +46,16 @@ use crate::{location_nearby_connections, sharing_nearby};
 
 const SANE_FRAME_LENGTH: i32 = 5 * 1024 * 1024;
 const SANITY_DURATION: Duration = Duration::from_micros(10);
+
+/// Map a nearby-rs `StreamChannel` write `Exception` to our `Result`
+/// (`Success` => `Ok`). Used on the `QS_BWU_ACTOR` write path.
+fn exception_to_result(ex: Exception) -> Result<(), anyhow::Error> {
+    if ex == Exception::Success {
+        Ok(())
+    } else {
+        Err(anyhow!("StreamChannel write failed: {ex:?}"))
+    }
+}
 
 #[derive(Debug)]
 /// A swappable transport so a connection bootstrapped over BLE L2CAP (the duplex
@@ -92,6 +106,14 @@ impl AsyncWrite for Transport {
 
 pub struct InboundRequest<S = TcpStream> {
     socket: S,
+    // QS_BWU_ACTOR: when set, the nearby-rs `StreamChannel` (an `EndpointChannelBridge`
+    // over the same transport) owns framing + d2d crypto + the sequence counters.
+    // Reads come from it (fed in via `handle_via_channel`); writes route through it
+    // (`encrypt_and_send`/`send_frame`); the post-decode dispatch runs via
+    // `process_decoded_offline_frame`. None = the proven inline path. The shared
+    // `state.session` is installed as the channel's cipher once UKEY2 completes, so
+    // the channel is the single sequence authority (no double-advance).
+    channel: Option<Arc<dyn EndpointChannel>>,
     pub state: InnerState,
     sender: Sender<ChannelMessage>,
     receiver: Receiver<ChannelMessage>,
@@ -119,6 +141,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> InboundRequest<S> {
 
         Self {
             socket,
+            channel: None,
             state: InnerState {
                 id,
                 server_seq: 0,
@@ -237,64 +260,100 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> InboundRequest<S> {
         self.encrypt_and_send(&frame).await
     }
 
+    /// Install the nearby-rs `StreamChannel` as the framing/crypto/sequence layer
+    /// for the `QS_BWU_ACTOR` receive path. After this, drive the loop with
+    /// [`handle_via_channel`](Self::handle_via_channel) (not [`handle`](Self::handle)),
+    /// and route writes through the channel.
+    pub fn set_channel(&mut self, channel: Arc<dyn EndpointChannel>) {
+        self.channel = Some(channel);
+    }
+
     pub async fn handle(&mut self) -> Result<(), anyhow::Error> {
         // Buffer for the 4-byte length
         let mut length_buf = [0u8; 4];
 
         tokio::select! {
-            i = self.receiver.recv() => {
-                match i {
-                    Ok(channel_msg) => {
-                        if channel_msg.direction == ChannelDirection::LibToFront {
-                            return Ok(());
-                        }
-
-                        if channel_msg.id != self.state.id {
-                            return Ok(());
-                        }
-
-                        debug!("inbound: got: {:?}", channel_msg);
-                        match channel_msg.action {
-                            Some(ChannelAction::AcceptTransfer) => {
-                                self.accept_transfer().await?;
-                            },
-                            Some(ChannelAction::RejectTransfer) => {
-                                self.update_state(
-                                    |e| {
-                                        e.state = State::Rejected;
-                                    },
-                                    true,
-                                ).await;
-
-                                self.reject_transfer(Some(
-                                    sharing_nearby::connection_response_frame::Status::Reject
-                                )).await?;
-                                return Err(anyhow!(crate::errors::AppError::NotAnError));
-                            },
-                            Some(ChannelAction::CancelTransfer) => {
-                                self.update_state(
-                                    |e| {
-                                        e.state = State::Cancelled;
-                                    },
-                                    true,
-                                ).await;
-                                self.disconnection().await?;
-                                return Err(anyhow!(crate::errors::AppError::NotAnError));
-                            },
-                            None => {
-                                trace!("inbound: nothing to do")
-                            },
-                        }
-                    }
-                    Err(e) => {
-                        error!("inbound: channel error: {}", e);
-                    }
-                }
-            },
+            i = self.receiver.recv() => self.handle_command(i).await,
             h = stream_read_exact(&mut self.socket, &mut length_buf) => {
                 h?;
+                self._handle(length_buf).await
+            }
+        }
+    }
 
-                self._handle(length_buf).await?
+    /// `QS_BWU_ACTOR` receive driver: like [`handle`](Self::handle), but the next
+    /// already-deframed (and, post-UKEY2, decrypted) frame comes from the
+    /// `StreamChannel` reader over `frame_rx` instead of a socket read. App commands
+    /// (accept/reject/cancel) are still serviced on the same select.
+    pub async fn handle_via_channel(
+        &mut self,
+        frame_rx: &mut tokio::sync::mpsc::Receiver<Vec<u8>>,
+    ) -> Result<(), anyhow::Error> {
+        tokio::select! {
+            i = self.receiver.recv() => self.handle_command(i).await,
+            f = frame_rx.recv() => match f {
+                Some(bytes) => self.process_frame(bytes).await,
+                // Channel reader closed (transport gone) — end the loop.
+                None => Err(anyhow!(crate::errors::AppError::NotAnError)),
+            }
+        }
+    }
+
+    /// Service one inbound app command (accept/reject/cancel) from the broadcast
+    /// receiver. Shared by [`handle`](Self::handle) and
+    /// [`handle_via_channel`](Self::handle_via_channel).
+    async fn handle_command(
+        &mut self,
+        i: Result<ChannelMessage, tokio::sync::broadcast::error::RecvError>,
+    ) -> Result<(), anyhow::Error> {
+        match i {
+            Ok(channel_msg) => {
+                if channel_msg.direction == ChannelDirection::LibToFront {
+                    return Ok(());
+                }
+
+                if channel_msg.id != self.state.id {
+                    return Ok(());
+                }
+
+                debug!("inbound: got: {:?}", channel_msg);
+                match channel_msg.action {
+                    Some(ChannelAction::AcceptTransfer) => {
+                        self.accept_transfer().await?;
+                    }
+                    Some(ChannelAction::RejectTransfer) => {
+                        self.update_state(
+                            |e| {
+                                e.state = State::Rejected;
+                            },
+                            true,
+                        )
+                        .await;
+
+                        self.reject_transfer(Some(
+                            sharing_nearby::connection_response_frame::Status::Reject,
+                        ))
+                        .await?;
+                        return Err(anyhow!(crate::errors::AppError::NotAnError));
+                    }
+                    Some(ChannelAction::CancelTransfer) => {
+                        self.update_state(
+                            |e| {
+                                e.state = State::Cancelled;
+                            },
+                            true,
+                        )
+                        .await;
+                        self.disconnection().await?;
+                        return Err(anyhow!(crate::errors::AppError::NotAnError));
+                    }
+                    None => {
+                        trace!("inbound: nothing to do")
+                    }
+                }
+            }
+            Err(e) => {
+                error!("inbound: channel error: {}", e);
             }
         }
 
@@ -409,9 +468,20 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> InboundRequest<S> {
                 .await;
             }
             _ => {
-                trace!("Handling SecureMessage frame");
-                let smsg = SecureMessage::decode(&*frame_data)?;
-                self.decrypt_and_process_secure_message(&smsg).await?;
+                if self.channel.is_some() {
+                    // QS_BWU_ACTOR: the StreamChannel already stripped the framing
+                    // AND decrypted + sequence-checked the d2d message, so
+                    // `frame_data` is the inner OfflineFrame bytes — run the
+                    // post-decode dispatch directly (no SecureMessage / seq advance
+                    // here; the channel is the single sequence authority).
+                    let offline =
+                        location_nearby_connections::OfflineFrame::decode(&*frame_data)?;
+                    self.process_decoded_offline_frame(&offline).await?;
+                } else {
+                    trace!("Handling SecureMessage frame");
+                    let smsg = SecureMessage::decode(&*frame_data)?;
+                    self.decrypt_and_process_secure_message(&smsg).await?;
+                }
             }
         }
 
@@ -647,6 +717,18 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> InboundRequest<S> {
 
         self.send_frame(response.encode_to_vec()).await?;
 
+        // QS_BWU_ACTOR: this plaintext connection_response is the last unencrypted
+        // frame. Install the shared d2d session as the channel's cipher now, so the
+        // first encrypted frame below (and every read/write after) is encrypted with
+        // a continuous sequence — the channel becomes the single seq authority. The
+        // phone won't send its next (encrypted) frame until it receives the
+        // paired-key frame below, so the reader can't race ahead of this.
+        if let (Some(channel), Some(session)) =
+            (self.channel.as_ref(), self.state.session.as_ref())
+        {
+            channel.enable_encryption(session.clone());
+        }
+
         // When a WiFi upgrade is pending, DON'T start the sharing protocol yet —
         // otherwise the phone replies on the L2CAP channel we're about to abandon,
         // and its sequence counter races ahead of ours. Send it after the upgrade.
@@ -709,6 +791,18 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> InboundRequest<S> {
             ));
         }
 
+        self.process_decoded_offline_frame(&offline).await
+    }
+
+    /// The post-decode dispatch for one decrypted `OfflineFrame`. Split out of
+    /// `decrypt_and_process_secure_message` so the `QS_BWU_ACTOR` channel path —
+    /// where the `StreamChannel` already decrypted + sequence-checked the frame —
+    /// runs the identical dispatch without re-decrypting or re-advancing the d2d
+    /// sequence (the channel/cipher already did both).
+    async fn process_decoded_offline_frame(
+        &mut self,
+        offline: &OfflineFrame,
+    ) -> Result<(), anyhow::Error> {
         let v1_frame = offline
             .v1
             .as_ref()
@@ -1476,6 +1570,13 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> InboundRequest<S> {
     }
 
     async fn encrypt_and_send(&mut self, frame: &OfflineFrame) -> Result<(), anyhow::Error> {
+        // QS_BWU_ACTOR: the StreamChannel owns encryption + the d2d sequence. Hand
+        // it the plaintext OfflineFrame; its cipher (the shared UkeySession) encodes
+        // (encrypt + advance server_seq) and frames it. No inline seq advance here.
+        if let Some(channel) = self.channel.as_ref() {
+            return exception_to_result(channel.write(&frame.encode_to_vec()));
+        }
+
         let tx_seq = self.get_server_seq_inc().await;
         let tx_type = frame.v1.as_ref().and_then(|v| v.r#type).unwrap_or(0);
         let tx_bwu = frame
@@ -1517,6 +1618,14 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> InboundRequest<S> {
     }
 
     async fn send_frame(&mut self, data: Vec<u8>) -> Result<(), anyhow::Error> {
+        // QS_BWU_ACTOR: route the raw frame through the StreamChannel, which adds
+        // the 4B length framing. During the UKEY2 handshake the channel cipher is
+        // off, so this is a plaintext send (byte-identical to the inline path); it
+        // is only used pre-encryption, so the channel never double-encrypts here.
+        if let Some(channel) = self.channel.as_ref() {
+            return exception_to_result(channel.write(&data));
+        }
+
         let length = data.len();
 
         // Prepare length prefix in big-endian format
