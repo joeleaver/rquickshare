@@ -3,8 +3,9 @@ use std::os::unix::fs::FileExt;
 use std::sync::Arc;
 use std::time::Duration;
 
-use nearby_rs::bwu::EndpointChannel;
+use nearby_rs::bwu::{BwuHandle, EndpointChannel};
 use nearby_rs::frames::Exception;
+use nearby_rs::mediums::Medium as NbMedium;
 
 use anyhow::anyhow;
 use bytes::Bytes;
@@ -114,6 +115,12 @@ pub struct InboundRequest<S = TcpStream> {
     // `state.session` is installed as the channel's cipher once UKEY2 completes, so
     // the channel is the single sequence authority (no double-advance).
     channel: Option<Arc<dyn EndpointChannel>>,
+    // QS_BWU_ACTOR (Inc 2): the BwuActor handle + the endpoint id used to key it.
+    // When set, BandwidthUpgradeNegotiation frames read off the OLD channel are
+    // forwarded to the actor (which drives the upgrade handshake) instead of the
+    // inline `upgrade_rejected`/`prior_channel_drained`/`wifi_retry_requested` flags.
+    bwu_handle: Option<BwuHandle>,
+    bwu_ep: String,
     pub state: InnerState,
     sender: Sender<ChannelMessage>,
     receiver: Receiver<ChannelMessage>,
@@ -142,6 +149,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> InboundRequest<S> {
         Self {
             socket,
             channel: None,
+            bwu_handle: None,
+            bwu_ep: String::new(),
             state: InnerState {
                 id,
                 server_seq: 0,
@@ -266,6 +275,19 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> InboundRequest<S> {
     /// and route writes through the channel.
     pub fn set_channel(&mut self, channel: Arc<dyn EndpointChannel>) {
         self.channel = Some(channel);
+    }
+
+    /// QS_BWU_ACTOR (Inc 2): install the BwuActor handle + the endpoint id so
+    /// BandwidthUpgradeNegotiation frames on the OLD channel are routed to the actor.
+    pub fn set_bwu(&mut self, handle: BwuHandle, endpoint_id: impl Into<String>) {
+        self.bwu_handle = Some(handle);
+        self.bwu_ep = endpoint_id.into();
+    }
+
+    /// The shared UKEY2 d2d session, for installing as the upgraded channel's cipher
+    /// after a successful bandwidth upgrade (keeps the sequence continuous).
+    pub fn session(&self) -> Option<Arc<UkeySession>> {
+        self.state.session.clone()
     }
 
     pub async fn handle(&mut self) -> Result<(), anyhow::Error> {
@@ -1003,6 +1025,31 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> InboundRequest<S> {
                 self.send_keepalive(true).await?;
             }
             location_nearby_connections::v1_frame::FrameType::BandwidthUpgradeNegotiation => {
+                // QS_BWU_ACTOR (Inc 2): the actor drives the upgrade handshake. Hand
+                // it this negotiation frame (re-encoded into nearby-rs's proto, same
+                // wire format) and return — the actor writes LAST_WRITE/SAFE_TO_CLOSE
+                // and finalizes the channel swap; we never set the inline flags.
+                if let Some(handle) = self.bwu_handle.clone() {
+                    // Forward the negotiation frame (UPGRADE_FAILURE / LAST_WRITE /
+                    // SAFE_TO_CLOSE / …) to the actor, which drives the handshake. The
+                    // phone's STA-flap retry arrives as a separate FrameType::Bandwidth
+                    // UpgradeRetry (handled below) and sets `wifi_retry_requested`.
+                    let event = v1_frame
+                        .bandwidth_upgrade_negotiation
+                        .as_ref()
+                        .and_then(|b| b.event_type)
+                        .unwrap_or(0);
+                    debug!("BWU(actor): forwarding negotiation event {event} to the actor");
+                    let pb_frame = nearby_rs::proto::OfflineFrame::decode(
+                        offline.encode_to_vec().as_slice(),
+                    )
+                    .map_err(|e| anyhow!("re-decode OfflineFrame for the BWU actor: {e}"))?;
+                    handle
+                        .incoming_frame(pb_frame, self.bwu_ep.clone(), NbMedium::BleL2cap)
+                        .await;
+                    return Ok(());
+                }
+
                 use crate::location_nearby_connections::bandwidth_upgrade_negotiation_frame as bwu;
                 let event = v1_frame
                     .bandwidth_upgrade_negotiation

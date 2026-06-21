@@ -118,6 +118,23 @@ async fn write_frame<W: tokio::io::AsyncWrite + Unpin>(w: &mut W, payload: &[u8]
     Ok(())
 }
 
+// QS_BWU_ACTOR: a dedicated blocking thread that drains a StreamChannel (deframe +
+// decrypt once its cipher is installed) into an mpsc the async receive loop selects,
+// so a frame is never lost to select cancellation. Exits when the channel closes or
+// the receiver is dropped.
+fn spawn_channel_reader(channel: Arc<dyn EndpointChannel>, tx: mpsc::Sender<Vec<u8>>) {
+    std::thread::spawn(move || loop {
+        match channel.read() {
+            Ok(bytes) => {
+                if tx.blocking_send(bytes).is_err() {
+                    break;
+                }
+            }
+            Err(_) => break, // channel closed / transport gone
+        }
+    });
+}
+
 async fn handle(
     mut stream: Stream,
     inner: Vec<u8>,
@@ -246,48 +263,94 @@ async fn handle(
     // + upgrade routing are Inc 2. See .bwu-integration-design.md.
     let use_actor = std::env::var("QS_BWU_ACTOR").is_ok();
     if use_actor {
-        warn!(
-            "{INNER_NAME}: QS_BWU_ACTOR set — routing the receive path through the \
-             StreamChannel (Inc 1: data path, no WiFi upgrade)"
-        );
-        // The channel owns `proto`; a dedicated blocking reader drains it (deframe +
-        // decrypt once the cipher is installed) into an mpsc the async loop selects,
-        // so a frame is never lost to select cancellation. t_in/t_out still bridge
-        // L2CAP <-> `proto`, with the channel pumps sitting on the `proto` end.
+        warn!("{INNER_NAME}: QS_BWU_ACTOR set — routing the WiFi upgrade through the BwuActor (Inc 2)");
+        let ep = "PHONE"; // a stable key for the actor's endpoint maps
+        let lan = lan_ipv4();
+
+        // The channel owns `proto`; t_in/t_out still bridge L2CAP <-> `proto` with
+        // the channel pumps on the `proto` end. A dedicated blocking reader drains
+        // the channel (deframe + decrypt) into an mpsc the loop selects.
         let ecb = EndpointChannelBridge::new_plaintext(proto, "beamish", Medium::BleL2cap);
         let channel: Arc<dyn EndpointChannel> = ecb.channel.clone();
         let (frame_tx, mut frame_rx) = mpsc::channel::<Vec<u8>>(64);
-        let reader_chan = channel.clone();
-        std::thread::spawn(move || loop {
-            match reader_chan.read() {
-                Ok(bytes) => {
-                    if frame_tx.blocking_send(bytes).is_err() {
-                        break;
-                    }
-                }
-                Err(_) => break, // channel closed / transport gone
-            }
-        });
+        spawn_channel_reader(channel.clone(), frame_tx);
+
+        // The BwuActor + its WIFI_LAN handler: binds 0.0.0.0, advertises the LAN IP
+        // the phone dials. The actor offers UPGRADE_PATH_AVAILABLE, runs the new-
+        // channel handshake, and swaps the registered channel on convergence.
+        let bwu = super::bwu_channel::BwuSession::spawn(
+            ep,
+            std::net::Ipv4Addr::UNSPECIFIED,
+            std::net::Ipv4Addr::from(lan),
+        );
 
         // InboundRequest reads via the channel reader and writes via the channel, so
         // its own socket is inert — give it a throwaway duplex half.
         let (dummy, _dummy_peer) = tokio::io::duplex(8);
         let mut ir = InboundRequest::new(Transport::Duplex(dummy), id, sender);
-        ir.set_channel(channel);
+        ir.set_channel(channel.clone());
+        ir.set_bwu(bwu.handle.clone(), ep);
 
-        // Data-path loop: no WiFi offer (Inc 1). The whole transfer runs over L2CAP
-        // through the StreamChannel.
+        let mut offered = false;
+        let mut upgraded = false;
         loop {
-            if let Err(e) = ir.handle_via_channel(&mut frame_rx).await {
-                match e.downcast_ref::<crate::errors::AppError>() {
-                    Some(crate::errors::AppError::NotAnError) => {}
-                    _ => debug!("{INNER_NAME}: protocol ended: {e} (state {:?})", ir.state.state),
+            // Once the NC connection is accepted (and the channel cipher is on), drive
+            // the actor to OFFER a WIFI_LAN upgrade on the channel — replaces the
+            // inline offer_wifi_upgrade. FIFO command ordering means a subsequent
+            // is_upgrade_ongoing/get_upgraded_channel sees the in-progress upgrade.
+            if !offered && !upgraded && ir.state.state == State::SentConnectionResponse {
+                offered = true;
+                bwu.handle.connection_initiated(ep, false, false).await;
+                bwu.handle.connection_accepted(ep).await;
+                bwu.handle.register_channel(ep, channel.clone()).await;
+                bwu.handle.initiate_bwu(ep, Medium::WifiLan).await;
+                info!("{INNER_NAME}: BWU(actor) offered WIFI_LAN {lan:?}; awaiting handshake");
+            } else if offered && !upgraded && ir.wifi_retry_requested {
+                // The phone's WiFi recovered (BANDWIDTH_UPGRADE_RETRY). The prior
+                // UPGRADE_FAILURE cleared the actor's in-progress state + reverted the
+                // listener, so re-initiating binds a fresh listener and re-offers.
+                ir.wifi_retry_requested = false;
+                info!("{INNER_NAME}: BWU(actor) re-offering WIFI_LAN (phone WiFi recovered)");
+                bwu.handle.initiate_bwu(ep, Medium::WifiLan).await;
+            }
+
+            match ir.handle_via_channel(&mut frame_rx).await {
+                Ok(()) => {}
+                Err(e) => {
+                    let not_an_error = matches!(
+                        e.downcast_ref::<crate::errors::AppError>(),
+                        Some(crate::errors::AppError::NotAnError)
+                    );
+                    // The OLD reader closing (the actor closed the channel at the end
+                    // of the medium switch) surfaces here as NotAnError. If the upgrade
+                    // converged to WIFI_LAN, hand off to the upgraded channel and keep
+                    // going on WiFi; otherwise it's a genuine end of the transfer.
+                    if offered && !upgraded && not_an_error {
+                        if let Some(new_chan) = bwu.handle.get_upgraded_channel(ep).await {
+                            if new_chan.medium() == Medium::WifiLan {
+                                info!("{INNER_NAME}: BWU(actor) converged; continuing on WiFi-LAN");
+                                upgraded = true;
+                                if let Some(session) = ir.session() {
+                                    new_chan.enable_encryption(session);
+                                }
+                                let (ntx, nrx) = mpsc::channel::<Vec<u8>>(64);
+                                spawn_channel_reader(new_chan.clone(), ntx);
+                                frame_rx = nrx;
+                                ir.set_channel(new_chan);
+                                continue;
+                            }
+                        }
+                    }
+                    if !not_an_error {
+                        debug!("{INNER_NAME}: protocol ended: {e} (state {:?})", ir.state.state);
+                    }
+                    break;
                 }
-                break;
             }
         }
 
         drop(ecb); // keep the channel pumps alive until the loop ends
+        drop(bwu);
         t_in.abort();
         t_out.abort();
         return Ok(());
