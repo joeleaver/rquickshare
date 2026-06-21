@@ -121,6 +121,11 @@ pub struct InboundRequest<S = TcpStream> {
     // inline `upgrade_rejected`/`prior_channel_drained`/`wifi_retry_requested` flags.
     bwu_handle: Option<BwuHandle>,
     bwu_ep: String,
+    // Set when the phone's LAST_WRITE_TO_PRIOR_CHANNEL (its final OLD-channel frame)
+    // is forwarded to the actor — the l2cap driver's cue to un-park the phone and
+    // hand off to WiFi without waiting for the actor's process_safe_to_close (the
+    // Pixel never sends SAFE_TO_CLOSE; it parks its OLD read instead).
+    pub bwu_last_write_seen: bool,
     pub state: InnerState,
     sender: Sender<ChannelMessage>,
     receiver: Receiver<ChannelMessage>,
@@ -151,6 +156,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> InboundRequest<S> {
             channel: None,
             bwu_handle: None,
             bwu_ep: String::new(),
+            bwu_last_write_seen: false,
             state: InnerState {
                 id,
                 server_seq: 0,
@@ -1034,11 +1040,18 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> InboundRequest<S> {
                     // SAFE_TO_CLOSE / …) to the actor, which drives the handshake. The
                     // phone's STA-flap retry arrives as a separate FrameType::Bandwidth
                     // UpgradeRetry (handled below) and sets `wifi_retry_requested`.
+                    use crate::location_nearby_connections::bandwidth_upgrade_negotiation_frame as bwu;
                     let event = v1_frame
                         .bandwidth_upgrade_negotiation
                         .as_ref()
                         .and_then(|b| b.event_type)
                         .unwrap_or(0);
+                    // The phone's LAST_WRITE is its final OLD-channel frame — cue the
+                    // l2cap driver to nudge + hand off to WiFi (it doesn't wait for the
+                    // actor's SAFE_TO_CLOSE handshake, which the Pixel never completes).
+                    if event == bwu::EventType::LastWriteToPriorChannel as i32 {
+                        self.bwu_last_write_seen = true;
+                    }
                     debug!("BWU(actor): forwarding negotiation event {event} to the actor");
                     let pb_frame = nearby_rs::proto::OfflineFrame::decode(
                         offline.encode_to_vec().as_slice(),

@@ -135,6 +135,24 @@ fn spawn_channel_reader(channel: Arc<dyn EndpointChannel>, tx: mpsc::Sender<Vec<
     });
 }
 
+// A plaintext KEEP_ALIVE OfflineFrame (no BLE wrapping — t_out adds the [4B outer]
+// [3B service-id hash] toward L2CAP, and the StreamChannel adds the [4B len]). Used
+// on the cipher-disabled OLD channel to un-park the phone's prior-channel read after
+// the medium switch, landing plaintext like the proven t_out nudge.
+fn plain_keepalive() -> Vec<u8> {
+    use crate::location_nearby_connections as lnc;
+    use prost::Message;
+    lnc::OfflineFrame {
+        version: Some(lnc::offline_frame::Version::V1.into()),
+        v1: Some(lnc::V1Frame {
+            r#type: Some(lnc::v1_frame::FrameType::KeepAlive.into()),
+            keep_alive: Some(lnc::KeepAliveFrame { ack: Some(false) }),
+            ..Default::default()
+        }),
+    }
+    .encode_to_vec()
+}
+
 async fn handle(
     mut stream: Stream,
     inner: Vec<u8>,
@@ -314,34 +332,83 @@ async fn handle(
                 bwu.handle.initiate_bwu(ep, Medium::WifiLan).await;
             }
 
-            match ir.handle_via_channel(&mut frame_rx).await {
+            // Hybrid teardown: the phone's LAST_WRITE means the actor registered the
+            // NEW channel and is sending SAFE_TO_CLOSE; the Pixel then parks its OLD
+            // read (it never sends its own SAFE_TO_CLOSE, so the actor's
+            // process_safe_to_close would stall). Don't wait for it — un-park the
+            // phone and switch to WiFi ourselves.
+            if offered && !upgraded && ir.bwu_last_write_seen {
+                ir.bwu_last_write_seen = false;
+                // run_upgrade_protocol (registers the NEW channel) runs on the actor
+                // task and may not be done when the phone's LAST_WRITE reached us —
+                // poll briefly for the WIFI_LAN channel.
+                let mut new_chan = None;
+                for _ in 0..30 {
+                    match bwu.handle.get_upgraded_channel(ep).await {
+                        Some(c) if c.medium() == Medium::WifiLan => {
+                            new_chan = Some(c);
+                            break;
+                        }
+                        _ => tokio::time::sleep(std::time::Duration::from_millis(100)).await,
+                    }
+                }
+                if let Some(new_chan) = new_chan {
+                    upgraded = true;
+                    // Un-park the phone: it parked its OLD read after our SAFE_TO_CLOSE.
+                    // The OLD channel is abandoned now, so disable its cipher and feed
+                    // plaintext KEEP_ALIVEs (the phone DisableEncryption'd its OLD side
+                    // too); t_out wraps them into BLE framing toward L2CAP. The delay
+                    // lets the actor's SAFE_TO_CLOSE reach the phone first.
+                    let nudge = channel.clone();
+                    tokio::spawn(async move {
+                        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+                        nudge.disable_encryption();
+                        let ka = plain_keepalive();
+                        for _ in 0..25 {
+                            if nudge.write(&ka) != nearby_rs::frames::Exception::Success {
+                                break; // phone closed OLD — it switched to WiFi
+                            }
+                            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                        }
+                    });
+                    // Continue the transfer on the NEW (WiFi) channel: resume it (the
+                    // upgrade protocol paused it), install the shared session so the d2d
+                    // sequence continues, then read it via a fresh blocking reader.
+                    new_chan.resume();
+                    if let Some(session) = ir.session() {
+                        new_chan.enable_encryption(session);
+                    }
+                    let (ntx, nrx) = mpsc::channel::<Vec<u8>>(64);
+                    spawn_channel_reader(new_chan.clone(), ntx);
+                    frame_rx = nrx;
+                    ir.set_channel(new_chan);
+                    info!("{INNER_NAME}: BWU(actor) handoff to WiFi-LAN (nudging the prior channel)");
+                    continue;
+                }
+                warn!("{INNER_NAME}: BWU(actor) saw LAST_WRITE but no WIFI_LAN channel; staying on L2CAP");
+            }
+
+            // Drive one frame/command. While an upgrade is offered but not yet handed
+            // off, bound the wait so a failed un-park can't hang the loop forever.
+            let step = ir.handle_via_channel(&mut frame_rx);
+            let r = if offered && !upgraded {
+                match tokio::time::timeout(std::time::Duration::from_secs(15), step).await {
+                    Ok(r) => r,
+                    Err(_) => {
+                        warn!("{INNER_NAME}: BWU(actor) upgrade stalled 15s; ending transfer");
+                        break;
+                    }
+                }
+            } else {
+                step.await
+            };
+            match r {
                 Ok(()) => {}
                 Err(e) => {
-                    let not_an_error = matches!(
+                    if !matches!(
                         e.downcast_ref::<crate::errors::AppError>(),
                         Some(crate::errors::AppError::NotAnError)
-                    );
-                    // The OLD reader closing (the actor closed the channel at the end
-                    // of the medium switch) surfaces here as NotAnError. If the upgrade
-                    // converged to WIFI_LAN, hand off to the upgraded channel and keep
-                    // going on WiFi; otherwise it's a genuine end of the transfer.
-                    if offered && !upgraded && not_an_error {
-                        if let Some(new_chan) = bwu.handle.get_upgraded_channel(ep).await {
-                            if new_chan.medium() == Medium::WifiLan {
-                                info!("{INNER_NAME}: BWU(actor) converged; continuing on WiFi-LAN");
-                                upgraded = true;
-                                if let Some(session) = ir.session() {
-                                    new_chan.enable_encryption(session);
-                                }
-                                let (ntx, nrx) = mpsc::channel::<Vec<u8>>(64);
-                                spawn_channel_reader(new_chan.clone(), ntx);
-                                frame_rx = nrx;
-                                ir.set_channel(new_chan);
-                                continue;
-                            }
-                        }
-                    }
-                    if !not_an_error {
+                    ) {
                         debug!("{INNER_NAME}: protocol ended: {e} (state {:?})", ir.state.state);
                     }
                     break;
