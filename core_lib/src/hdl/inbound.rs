@@ -1138,6 +1138,21 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> InboundRequest<S> {
             return Err(anyhow!(crate::errors::AppError::NotAnError));
         }
 
+        // Diagnostic: name the sharing-frame type + which payload fields are present
+        // for every handshake control frame (low volume — one per completed Bytes
+        // payload). On a Pixel run this pins which frame lands in which handshake
+        // state, e.g. the intermittent stray frame seen in ReceivedPairedKeyResult.
+        debug!(
+            "process_transfer_setup: state={:?} sharing_frame_type={:?} has_intro={} \
+             has_pke={} has_pkr={} has_cert={}",
+            self.state.state,
+            v1_frame.r#type(),
+            v1_frame.introduction.is_some(),
+            v1_frame.paired_key_encryption.is_some(),
+            v1_frame.paired_key_result.is_some(),
+            v1_frame.certificate_info.is_some(),
+        );
+
         match self.state.state {
             State::SentConnectionResponse => {
                 debug!("Processing State::SentConnectionResponse");
@@ -1162,8 +1177,31 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> InboundRequest<S> {
                 .await;
             }
             State::ReceivedPairedKeyResult => {
-                debug!("Processing State::ReceivedPairedKeyResult");
-                self.process_introduction(v1_frame).await?;
+                debug!(
+                    "Processing State::ReceivedPairedKeyResult (sharing frame type = {:?})",
+                    v1_frame.r#type()
+                );
+                // Dispatch by frame TYPE, not by arrival position. The Quick Share
+                // sender occasionally interposes one extra non-INTRODUCTION sharing
+                // frame here (a duplicate PAIRED_KEY_*, a deprecated CERTIFICATE_INFO,
+                // or an UNKNOWN/empty frame) before the real INTRODUCTION. Google's
+                // receiver (nearby_sharing_service_impl.cc, OnIncomingSessionFrameRead
+                // `default` arm) discards such a frame and keeps reading rather than
+                // aborting; do the same instead of tearing down the whole transfer
+                // with "Missing required fields". CANCEL is already handled above.
+                //
+                // Gate on r#type() == Introduction (NOT introduction.is_some()) so a
+                // genuinely malformed INTRODUCTION (type 1 but empty payload) still
+                // reaches process_introduction and surfaces its real error.
+                if v1_frame.r#type() == sharing_nearby::v1_frame::FrameType::Introduction {
+                    self.process_introduction(v1_frame).await?;
+                } else {
+                    info!(
+                        "Discarding non-INTRODUCTION sharing frame of type {:?} while \
+                         awaiting introduction; staying in ReceivedPairedKeyResult",
+                        v1_frame.r#type()
+                    );
+                }
             }
             _ => {
                 info!(
@@ -1818,5 +1856,102 @@ mod nearby_rs_conformance {
         let mut b = Vec::new();
         theirs.encode(&mut b).unwrap();
         assert_eq!(a, b, "nearby-rs WIFI_LAN offer differs from the proven one");
+    }
+}
+
+// Regression coverage for the intermittent "Missing required fields" handshake abort:
+// while in ReceivedPairedKeyResult the receiver must tolerate (discard) a stray
+// non-INTRODUCTION sharing frame and keep waiting, mirroring Google Nearby's receiver,
+// rather than tearing down the whole transfer. Drives process_transfer_setup directly —
+// no live socket I/O is needed (the discard path and the text-introduction path never
+// touch the socket).
+#[cfg(test)]
+mod handshake_frame_tolerance {
+    use super::*;
+    use sharing_nearby::v1_frame::FrameType;
+
+    fn sharing_frame(
+        t: FrameType,
+        introduction: Option<sharing_nearby::IntroductionFrame>,
+    ) -> sharing_nearby::Frame {
+        sharing_nearby::Frame {
+            version: Some(sharing_nearby::frame::Version::V1.into()),
+            v1: Some(sharing_nearby::V1Frame {
+                r#type: Some(t.into()),
+                introduction,
+                ..Default::default()
+            }),
+        }
+    }
+
+    fn new_request() -> InboundRequest<DuplexStream> {
+        // The peer half is dropped: process_transfer_setup never reads/writes the
+        // socket on the paths under test. InboundRequest::new subscribes its own
+        // broadcast receiver, so update_state's send always has a live receiver.
+        let (sock, _peer) = tokio::io::duplex(1024);
+        let (tx, _rx) = tokio::sync::broadcast::channel::<ChannelMessage>(16);
+        let mut ir = InboundRequest::new(sock, "test-ep".to_string(), tx);
+        ir.state.state = State::ReceivedPairedKeyResult;
+        ir
+    }
+
+    #[tokio::test]
+    async fn discards_stray_non_introduction_frames() {
+        for t in [
+            FrameType::PairedKeyResult,
+            FrameType::PairedKeyEncryption,
+            FrameType::CertificateInfo,
+            FrameType::UnknownFrameType,
+        ] {
+            let mut ir = new_request();
+            let res = ir.process_transfer_setup(&sharing_frame(t, None)).await;
+            assert!(res.is_ok(), "frame type {t:?} should be discarded, got {res:?}");
+            assert_eq!(
+                ir.state.state,
+                State::ReceivedPairedKeyResult,
+                "discarding {t:?} must not advance the handshake state"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn real_introduction_advances_to_consent() {
+        let mut ir = new_request();
+        // A single text_metadata entry takes the pure-state-update branch (no
+        // filesystem, no socket): process_introduction sets WaitingForUserConsent.
+        let intro = sharing_nearby::IntroductionFrame {
+            text_metadata: vec![sharing_nearby::TextMetadata {
+                r#type: Some(text_metadata::Type::Text.into()),
+                payload_id: Some(1),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let res = ir
+            .process_transfer_setup(&sharing_frame(FrameType::Introduction, Some(intro)))
+            .await;
+        assert!(res.is_ok(), "a real introduction must be processed: {res:?}");
+        assert_eq!(ir.state.state, State::WaitingForUserConsent);
+    }
+
+    #[tokio::test]
+    async fn malformed_introduction_still_errors() {
+        // type == INTRODUCTION but the payload is None: gating on r#type() (not
+        // introduction.is_some()) routes it into process_introduction so the genuine
+        // error still surfaces instead of being silently swallowed by the discard arm.
+        let mut ir = new_request();
+        let res = ir
+            .process_transfer_setup(&sharing_frame(FrameType::Introduction, None))
+            .await;
+        let err = res.expect_err("a malformed introduction must error, not be discarded");
+        assert!(
+            err.to_string().contains("Missing required fields"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(
+            ir.state.state,
+            State::ReceivedPairedKeyResult,
+            "a failed introduction must not advance the handshake state"
+        );
     }
 }
