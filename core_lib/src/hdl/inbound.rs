@@ -4,8 +4,6 @@ use std::time::Duration;
 
 use anyhow::anyhow;
 use bytes::Bytes;
-use hmac::{Hmac, Mac};
-use libaes::{Cipher, AES_256_KEY_LEN};
 use p256::ecdh::diffie_hellman;
 use p256::elliptic_curve::sec1::{FromEncodedPoint, ToEncodedPoint};
 use p256::{EncodedPoint, PublicKey};
@@ -19,7 +17,7 @@ use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf};
 use tokio::net::TcpStream;
 use tokio::sync::broadcast::{Receiver, Sender};
 
-use super::{InnerState, State};
+use super::{InnerState, State, UkeySession};
 use crate::channel::{ChannelAction, ChannelDirection, ChannelMessage};
 use crate::hdl::info::{InternalFileInfo, TransferMetadata};
 use crate::hdl::{TextPayloadInfo, TextPayloadType};
@@ -29,12 +27,11 @@ use crate::location_nearby_connections::payload_transfer_frame::{
 use crate::location_nearby_connections::{KeepAliveFrame, OfflineFrame, PayloadTransferFrame};
 use crate::securegcm::ukey2_alert::AlertType;
 use crate::securegcm::{
-    ukey2_message, DeviceToDeviceMessage, GcmMetadata, Type, Ukey2Alert, Ukey2ClientFinished,
-    Ukey2ClientInit, Ukey2HandshakeCipher, Ukey2Message, Ukey2ServerInit,
+    ukey2_message, Ukey2Alert, Ukey2ClientFinished, Ukey2ClientInit, Ukey2HandshakeCipher,
+    Ukey2Message, Ukey2ServerInit,
 };
 use crate::securemessage::{
-    EcP256PublicKey, EncScheme, GenericPublicKey, Header, HeaderAndBody, PublicKeyType,
-    SecureMessage, SigScheme,
+    EcP256PublicKey, GenericPublicKey, PublicKeyType, SecureMessage,
 };
 use crate::sharing_nearby::{paired_key_result_frame, text_metadata};
 use crate::utils::{
@@ -42,8 +39,6 @@ use crate::utils::{
     stream_read_exact, to_four_digit_string, DeviceType, RemoteDeviceInfo,
 };
 use crate::{location_nearby_connections, sharing_nearby};
-
-type HmacSha256 = Hmac<Sha256>;
 
 const SANE_FRAME_LENGTH: i32 = 5 * 1024 * 1024;
 const SANITY_DURATION: Duration = Duration::from_micros(10);
@@ -228,36 +223,15 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> InboundRequest<S> {
     /// Send a BANDWIDTH_UPGRADE_NEGOTIATION / UPGRADE_PATH_AVAILABLE offering a
     /// WIFI_LAN socket, so the sender connects over TCP for the bulk transfer.
     pub async fn send_wifi_upgrade(&mut self, ip: [u8; 4], port: u16) -> Result<(), anyhow::Error> {
-        use crate::location_nearby_connections as lnc;
-        use lnc::bandwidth_upgrade_negotiation_frame as bwu;
-
-        let frame = OfflineFrame {
-            version: Some(lnc::offline_frame::Version::V1.into()),
-            v1: Some(lnc::V1Frame {
-                r#type: Some(lnc::v1_frame::FrameType::BandwidthUpgradeNegotiation.into()),
-                bandwidth_upgrade_negotiation: Some(lnc::BandwidthUpgradeNegotiationFrame {
-                    event_type: Some(bwu::EventType::UpgradePathAvailable.into()),
-                    upgrade_path_info: Some(bwu::UpgradePathInfo {
-                        medium: Some(bwu::upgrade_path_info::Medium::WifiLan.into()),
-                        wifi_lan_socket: Some(bwu::upgrade_path_info::WifiLanSocket {
-                            ip_address: Some(ip.to_vec()),
-                            wifi_port: Some(port as i32),
-                            // Modern Pixel firmware ignores the legacy ip_address/
-                            // wifi_port and REQUIRES address_candidates; an offer
-                            // without it is rejected pre-connect (UPGRADE_FAILURE,
-                            // zero SYNs). Mirror the legacy IPv4 here.
-                            address_candidates: vec![lnc::ServiceAddress {
-                                ip_address: Some(ip.to_vec()),
-                                port: Some(port as i32),
-                            }],
-                        }),
-                        supports_client_introduction_ack: Some(true),
-                        ..Default::default()
-                    }),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            }),
+        // Validation hook: when QS_NEARBY_RS_FRAME is set, emit the
+        // UPGRADE_PATH_AVAILABLE built by the nearby-rs port (golden-tested
+        // against Google's `for_bwu_wifi_lan_path_available`) instead of our
+        // hand-rolled one, to confirm the Pixel accepts it. Default = our frame.
+        let frame = if std::env::var("QS_NEARBY_RS_FRAME").is_ok() {
+            info!("BWU: building UPGRADE_PATH_AVAILABLE via nearby-rs (QS_NEARBY_RS_FRAME)");
+            nearby_rs_wifi_upgrade_frame(ip, port)
+        } else {
+            beamish_wifi_upgrade_frame(ip, port)
         };
         info!("BWU: offering WIFI_LAN {}.{}.{}.{}:{port}", ip[0], ip[1], ip[2], ip[3]);
         self.encrypt_and_send(&frame).await
@@ -704,33 +678,20 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> InboundRequest<S> {
         &mut self,
         smsg: &SecureMessage,
     ) -> Result<(), anyhow::Error> {
-        let mut hmac = HmacSha256::new_from_slice(self.state.recv_hmac_key.as_ref().unwrap())?;
-        hmac.update(&smsg.header_and_body);
-        if !hmac
-            .finalize()
-            .into_bytes()
-            .as_slice()
-            .eq(smsg.signature.as_slice())
-        {
-            return Err(anyhow!("hmac!=signature"));
-        }
-
-        let header_and_body = HeaderAndBody::decode(&*smsg.header_and_body)?;
-
-        let msg_data = header_and_body.body;
-        let key = self.state.decrypt_key.as_ref().unwrap();
-
-        let mut cipher = Cipher::new_256(key[..AES_256_KEY_LEN].try_into()?);
-        cipher.set_auto_padding(true);
-        let decrypted = cipher.cbc_decrypt(header_and_body.header.iv(), &msg_data);
-
-        let d2d_msg = DeviceToDeviceMessage::decode(&*decrypted)?;
+        // Delegate the d2d crypto to the shared session (byte-identical to the old
+        // inline path); it returns the declared sequence + the inner frame bytes
+        // without touching the counter, so the seq policy + trace below are unchanged.
+        let session = self
+            .state
+            .session
+            .clone()
+            .ok_or_else(|| anyhow!("decrypt before UKEY2 session established"))?;
+        let (recv_seq, frame_bytes) = session.decode_payload(smsg)?;
 
         let seq = self.get_client_seq_inc().await;
-        let recv_seq = d2d_msg.sequence_number();
         // Decode the frame BEFORE the seq check so the trace shows the frame type
         // (critical for diagnosing the medium-switch channel drain).
-        let offline = location_nearby_connections::OfflineFrame::decode(d2d_msg.message())?;
+        let offline = location_nearby_connections::OfflineFrame::decode(frame_bytes.as_slice())?;
         let rx_type = offline.v1.as_ref().and_then(|v| v.r#type).unwrap_or(0);
         let rx_bwu = offline
             .v1
@@ -1407,12 +1368,18 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> InboundRequest<S> {
         let server_key = hkdf_extract_expand(&key_salt, &d2d_server, "ENC:2".as_bytes(), 32)?;
         let server_hmac_key = hkdf_extract_expand(&key_salt, &d2d_server, "SIG:1".as_bytes(), 32)?;
 
+        // The shared cipher session — the single source of truth for the keys and
+        // the d2d sequence counters from here on. Built before the keys are moved
+        // into InnerState so both stay in sync.
+        let session = UkeySession::new(&server_key, &server_hmac_key, &client_key, &client_hmac_key)?;
+
         self.update_state(
             |e| {
                 e.decrypt_key = Some(client_key);
                 e.recv_hmac_key = Some(client_hmac_key);
                 e.encrypt_key = Some(server_key);
                 e.send_hmac_key = Some(server_hmac_key);
+                e.session = Some(session);
                 e.pin_code = Some(to_four_digit_string(&auth_string));
                 e.encryption_done = true;
             },
@@ -1517,46 +1484,17 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> InboundRequest<S> {
             .and_then(|v| v.bandwidth_upgrade_negotiation.as_ref())
             .and_then(|b| b.event_type);
         trace!("TX d2d seq={tx_seq} frametype={tx_type} bwu_event={tx_bwu:?}");
-        let d2d_msg = DeviceToDeviceMessage {
-            sequence_number: Some(tx_seq),
-            message: Some(frame.encode_to_vec()),
-        };
 
-        let key = self.state.encrypt_key.as_ref().unwrap();
-        let msg_data = d2d_msg.encode_to_vec();
-        let iv = gen_random(16);
+        // Delegate the d2d crypto to the shared session (byte-identical to the old
+        // inline path). tx_seq was just advanced via the same session.
+        let session = self
+            .state
+            .session
+            .clone()
+            .ok_or_else(|| anyhow!("encrypt_and_send before UKEY2 session established"))?;
+        let smsg_bytes = session.encode_payload(&frame.encode_to_vec(), tx_seq, &gen_random(16));
 
-        let mut cipher = Cipher::new_256(&key[..AES_256_KEY_LEN].try_into().unwrap());
-        cipher.set_auto_padding(true);
-        let encrypted = cipher.cbc_encrypt(&iv, &msg_data);
-
-        let hb = HeaderAndBody {
-            body: encrypted,
-            header: Header {
-                encryption_scheme: EncScheme::Aes256Cbc.into(),
-                signature_scheme: SigScheme::HmacSha256.into(),
-                iv: Some(iv),
-                public_metadata: Some(
-                    GcmMetadata {
-                        r#type: Type::DeviceToDeviceMessage.into(),
-                        version: Some(1),
-                    }
-                    .encode_to_vec(),
-                ),
-                ..Default::default()
-            },
-        };
-
-        let mut hmac = HmacSha256::new_from_slice(self.state.send_hmac_key.as_ref().unwrap())?;
-        hmac.update(&hb.encode_to_vec());
-        let result = hmac.finalize();
-
-        let smsg = SecureMessage {
-            header_and_body: hb.encode_to_vec(),
-            signature: result.into_bytes().to_vec(),
-        };
-
-        self.send_frame(smsg.encode_to_vec()).await?;
+        self.send_frame(smsg_bytes).await?;
 
         Ok(())
     }
@@ -1600,26 +1538,22 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> InboundRequest<S> {
     }
 
     async fn get_server_seq_inc(&mut self) -> i32 {
-        self.update_state(
-            |e| {
-                e.server_seq += 1;
-            },
-            false,
-        )
-        .await;
-
+        // The session is authoritative once UKEY2 completes (so the sequence is
+        // continuous across the medium swap); state.server_seq mirrors it.
+        let next = match self.state.session.as_ref() {
+            Some(s) => s.next_server_seq(),
+            None => self.state.server_seq + 1,
+        };
+        self.update_state(|e| e.server_seq = next, false).await;
         self.state.server_seq
     }
 
     async fn get_client_seq_inc(&mut self) -> i32 {
-        self.update_state(
-            |e| {
-                e.client_seq += 1;
-            },
-            false,
-        )
-        .await;
-
+        let next = match self.state.session.as_ref() {
+            Some(s) => s.next_client_seq(),
+            None => self.state.client_seq + 1,
+        };
+        self.update_state(|e| e.client_seq = next, false).await;
         self.state.client_seq
     }
 
@@ -1646,5 +1580,74 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> InboundRequest<S> {
         // some spare time to process channel's message. Otherwise it
         // get spammed by new requests. Currently set to 10 micro secs.
         tokio::time::sleep(SANITY_DURATION).await;
+    }
+}
+
+/// rqs_lib's hand-rolled WIFI_LAN `UPGRADE_PATH_AVAILABLE` offer (the proven,
+/// Pixel-accepted frame).
+fn beamish_wifi_upgrade_frame(ip: [u8; 4], port: u16) -> OfflineFrame {
+    use crate::location_nearby_connections as lnc;
+    use lnc::bandwidth_upgrade_negotiation_frame as bwu;
+
+    OfflineFrame {
+        version: Some(lnc::offline_frame::Version::V1.into()),
+        v1: Some(lnc::V1Frame {
+            r#type: Some(lnc::v1_frame::FrameType::BandwidthUpgradeNegotiation.into()),
+            bandwidth_upgrade_negotiation: Some(lnc::BandwidthUpgradeNegotiationFrame {
+                event_type: Some(bwu::EventType::UpgradePathAvailable.into()),
+                upgrade_path_info: Some(bwu::UpgradePathInfo {
+                    medium: Some(bwu::upgrade_path_info::Medium::WifiLan.into()),
+                    wifi_lan_socket: Some(bwu::upgrade_path_info::WifiLanSocket {
+                        ip_address: Some(ip.to_vec()),
+                        wifi_port: Some(port as i32),
+                        address_candidates: vec![lnc::ServiceAddress {
+                            ip_address: Some(ip.to_vec()),
+                            port: Some(port as i32),
+                        }],
+                    }),
+                    supports_client_introduction_ack: Some(true),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
+    }
+}
+
+/// The same offer, built by the nearby-rs port (golden-tested against Google's
+/// `offline_frames.cc::ForBwuWifiLanPathAvailable`) and re-decoded into our
+/// proto type. Used to validate the port's WIFI_LAN frame against the Pixel.
+fn nearby_rs_wifi_upgrade_frame(ip: [u8; 4], port: u16) -> OfflineFrame {
+    let bytes = nearby_rs::frames::for_bwu_wifi_lan_path_available(&[
+        nearby_rs::frames::ServiceAddress {
+            address: ip.to_vec(),
+            port: port as i32,
+        },
+    ]);
+    OfflineFrame::decode(bytes.as_slice())
+        .expect("nearby-rs UPGRADE_PATH_AVAILABLE decodes as our OfflineFrame")
+}
+
+#[cfg(test)]
+mod nearby_rs_conformance {
+    use super::*;
+
+    #[test]
+    fn nearby_rs_wifi_upgrade_frame_is_byte_identical_to_ours() {
+        let ip = [192, 168, 1, 5];
+        let port = 49152u16;
+
+        let ours = beamish_wifi_upgrade_frame(ip, port);
+        let theirs = nearby_rs_wifi_upgrade_frame(ip, port);
+
+        // Same structure...
+        assert_eq!(ours, theirs);
+        // ...and byte-identical on the wire (what the Pixel actually sees).
+        let mut a = Vec::new();
+        ours.encode(&mut a).unwrap();
+        let mut b = Vec::new();
+        theirs.encode(&mut b).unwrap();
+        assert_eq!(a, b, "nearby-rs WIFI_LAN offer differs from the proven one");
     }
 }

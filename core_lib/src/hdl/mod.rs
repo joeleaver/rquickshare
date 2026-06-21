@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use p256::{PublicKey, SecretKey};
 use serde::{Deserialize, Serialize};
@@ -35,6 +36,10 @@ pub use l2cap::*;
 mod inbound;
 pub use inbound::*;
 pub(crate) mod info;
+mod ukey_session;
+pub use ukey_session::UkeySession;
+// Staged for the QS_BWU_ACTOR receive-path inversion; re-exported when wired in.
+mod bwu_channel;
 mod mdns_discovery;
 pub use mdns_discovery::*;
 mod mdns;
@@ -92,6 +97,11 @@ pub struct InnerState {
     pub recv_hmac_key: Option<Vec<u8>>,
     pub encrypt_key: Option<Vec<u8>>,
     pub send_hmac_key: Option<Vec<u8>>,
+    // The shared d2d cipher built from the four keys above. Authoritative for the
+    // sequence counters; the same Arc survives the L2CAP->WiFi swap so the
+    // sequence stays continuous, and it satisfies nearby_rs::bwu::Cipher for the
+    // bandwidth-upgrade port. None until UKEY2 key derivation completes.
+    pub session: Option<Arc<UkeySession>>,
 
     // Used to handle/track ingress transfer
     pub text_payload: Option<TextPayloadInfo>,
