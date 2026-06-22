@@ -1104,7 +1104,7 @@ checksum = "defc4c55412d89136f966bbb339008b474350e5e6e78d2714439c386b3137a03"
 [[package]]
 name = "nearby-rs"
 version = "0.1.0"
-source = "git+https://github.com/joeleaver/nearby-rs?branch=master#6c410a0f400b09407e9b7358d16921833632a098"
+source = "git+https://github.com/joeleaver/nearby-rs?branch=master#0a3f52241b17f1c43f29462309401c44eba9893d"
 dependencies = [
  "prost",
  "prost-build",

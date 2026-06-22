@@ -381,15 +381,20 @@ async fn handle(
                 info!("{INNER_NAME}: BWU(actor) offered {offer_medium:?} (lan {lan:?}); awaiting handshake");
             } else if offered && !upgraded && ir.wifi_retry_requested {
                 // The phone signalled BANDWIDTH_UPGRADE_RETRY (its WiFi recovered, or
-                // it bounced off our offer). The prior UPGRADE_FAILURE cleared the
-                // actor's in-progress state + reverted the medium, so re-initiating
-                // re-stands-up the path and re-offers.
+                // it bounced off our offer).
                 ir.wifi_retry_requested = false;
                 reoffers += 1;
                 if offer_medium == Medium::WifiHotspot && reoffers >= HOTSPOT_FALLBACK_AFTER {
                     offer_medium = Medium::WifiLan;
                     warn!("{INNER_NAME}: BWU(actor) WIFI_HOTSPOT stuck after {reoffers} tries; falling back to WIFI_LAN");
                 }
+                // Clear any in-progress upgrade WITHOUT reverting the handler first:
+                // the phone may retry without having sent an UPGRADE_FAILURE (which is
+                // what otherwise clears the actor's in-progress guard), so a bare
+                // re-initiate would be silently dropped. reset_upgrade unblocks the
+                // re-offer while reusing the standing medium (the pre-warmed SoftAP),
+                // so there's no AP churn. (#23)
+                bwu.handle.reset_upgrade(ep).await;
                 info!("{INNER_NAME}: BWU(actor) re-offering {offer_medium:?} (retry #{reoffers})");
                 bwu.handle.initiate_bwu(ep, offer_medium).await;
             }
