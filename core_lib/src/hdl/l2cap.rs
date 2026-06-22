@@ -293,13 +293,39 @@ async fn handle(
         let (frame_tx, mut frame_rx) = mpsc::channel::<Vec<u8>>(64);
         spawn_channel_reader(channel.clone(), frame_tx);
 
-        // The BwuActor + its WIFI_LAN handler: binds 0.0.0.0, advertises the LAN IP
-        // the phone dials. The actor offers UPGRADE_PATH_AVAILABLE, runs the new-
-        // channel handshake, and swaps the registered channel on convergence.
+        // Phase 4 offer policy: prefer a WIFI_HOTSPOT upgrade — the phone joins a
+        // SoftAP we stand up, which is immune to its infra-WiFi (STA) flap that makes
+        // the WIFI_LAN slow-start — when QS_BWU_HOTSPOT is set and the linux-softap
+        // build can bring an AP up; otherwise WIFI_LAN. `NmSoftAp::new()` returns
+        // None when there's no connected STA to co-channel against, so we cleanly
+        // fall back to WIFI_LAN.
+        #[cfg(all(feature = "linux-softap", target_os = "linux"))]
+        let softap: Option<Arc<dyn nearby_rs::bwu::SoftAp>> =
+            if std::env::var("QS_BWU_HOTSPOT").is_ok() {
+                super::nm_softap::NmSoftAp::new()
+                    .map(|s| Arc::new(s) as Arc<dyn nearby_rs::bwu::SoftAp>)
+            } else {
+                None
+            };
+        #[cfg(not(all(feature = "linux-softap", target_os = "linux")))]
+        let softap: Option<Arc<dyn nearby_rs::bwu::SoftAp>> = None;
+
+        let primary_medium = if softap.is_some() {
+            Medium::WifiHotspot
+        } else {
+            Medium::WifiLan
+        };
+
+        // The BwuActor + its medium handlers: the WIFI_LAN handler binds 0.0.0.0 and
+        // advertises the LAN IP the phone dials; the (optional) WIFI_HOTSPOT handler
+        // derives its bind/gateway from the SoftAP. The actor offers
+        // UPGRADE_PATH_AVAILABLE, runs the new-channel handshake, and swaps the
+        // registered channel on convergence.
         let bwu = super::bwu_channel::BwuSession::spawn(
             ep,
             std::net::Ipv4Addr::UNSPECIFIED,
             std::net::Ipv4Addr::from(lan),
+            softap,
         );
 
         // InboundRequest reads via the channel reader and writes via the channel, so
@@ -311,25 +337,39 @@ async fn handle(
 
         let mut offered = false;
         let mut upgraded = false;
+        // The medium currently offered. Starts at the primary (WIFI_HOTSPOT when a
+        // SoftAP is available, else WIFI_LAN); a stuck hotspot upgrade falls back to
+        // WIFI_LAN — the hotspot-primary / WIFI_LAN-fallback policy.
+        let mut offer_medium = primary_medium;
+        let mut reoffers = 0u32;
+        // Re-offer count after which a stuck WIFI_HOTSPOT upgrade gives up on the AP
+        // and falls back to the (slower but always-reachable) WIFI_LAN path.
+        const HOTSPOT_FALLBACK_AFTER: u32 = 3;
         loop {
             // Once the NC connection is accepted (and the channel cipher is on), drive
-            // the actor to OFFER a WIFI_LAN upgrade on the channel — replaces the
-            // inline offer_wifi_upgrade. FIFO command ordering means a subsequent
+            // the actor to OFFER the upgrade on the channel — replaces the inline
+            // offer_wifi_upgrade. FIFO command ordering means a subsequent
             // is_upgrade_ongoing/get_upgraded_channel sees the in-progress upgrade.
             if !offered && !upgraded && ir.state.state == State::SentConnectionResponse {
                 offered = true;
                 bwu.handle.connection_initiated(ep, false, false).await;
                 bwu.handle.connection_accepted(ep).await;
                 bwu.handle.register_channel(ep, channel.clone()).await;
-                bwu.handle.initiate_bwu(ep, Medium::WifiLan).await;
-                info!("{INNER_NAME}: BWU(actor) offered WIFI_LAN {lan:?}; awaiting handshake");
+                bwu.handle.initiate_bwu(ep, offer_medium).await;
+                info!("{INNER_NAME}: BWU(actor) offered {offer_medium:?} (lan {lan:?}); awaiting handshake");
             } else if offered && !upgraded && ir.wifi_retry_requested {
-                // The phone's WiFi recovered (BANDWIDTH_UPGRADE_RETRY). The prior
-                // UPGRADE_FAILURE cleared the actor's in-progress state + reverted the
-                // listener, so re-initiating binds a fresh listener and re-offers.
+                // The phone signalled BANDWIDTH_UPGRADE_RETRY (its WiFi recovered, or
+                // it bounced off our offer). The prior UPGRADE_FAILURE cleared the
+                // actor's in-progress state + reverted the medium, so re-initiating
+                // re-stands-up the path and re-offers.
                 ir.wifi_retry_requested = false;
-                info!("{INNER_NAME}: BWU(actor) re-offering WIFI_LAN (phone WiFi recovered)");
-                bwu.handle.initiate_bwu(ep, Medium::WifiLan).await;
+                reoffers += 1;
+                if offer_medium == Medium::WifiHotspot && reoffers >= HOTSPOT_FALLBACK_AFTER {
+                    offer_medium = Medium::WifiLan;
+                    warn!("{INNER_NAME}: BWU(actor) WIFI_HOTSPOT stuck after {reoffers} tries; falling back to WIFI_LAN");
+                }
+                info!("{INNER_NAME}: BWU(actor) re-offering {offer_medium:?} (retry #{reoffers})");
+                bwu.handle.initiate_bwu(ep, offer_medium).await;
             }
 
             // Hybrid teardown: the phone's LAST_WRITE means the actor registered the
@@ -341,11 +381,11 @@ async fn handle(
                 ir.bwu_last_write_seen = false;
                 // run_upgrade_protocol (registers the NEW channel) runs on the actor
                 // task and may not be done when the phone's LAST_WRITE reached us —
-                // poll briefly for the WIFI_LAN channel.
+                // poll briefly for the upgraded WiFi channel (WIFI_LAN or WIFI_HOTSPOT).
                 let mut new_chan = None;
                 for _ in 0..30 {
                     match bwu.handle.get_upgraded_channel(ep).await {
-                        Some(c) if c.medium() == Medium::WifiLan => {
+                        Some(c) if matches!(c.medium(), Medium::WifiLan | Medium::WifiHotspot) => {
                             new_chan = Some(c);
                             break;
                         }
@@ -374,6 +414,7 @@ async fn handle(
                     // Continue the transfer on the NEW (WiFi) channel: resume it (the
                     // upgrade protocol paused it), install the shared session so the d2d
                     // sequence continues, then read it via a fresh blocking reader.
+                    let new_medium = new_chan.medium();
                     new_chan.resume();
                     if let Some(session) = ir.session() {
                         new_chan.enable_encryption(session);
@@ -382,20 +423,28 @@ async fn handle(
                     spawn_channel_reader(new_chan.clone(), ntx);
                     frame_rx = nrx;
                     ir.set_channel(new_chan);
-                    info!("{INNER_NAME}: BWU(actor) handoff to WiFi-LAN (nudging the prior channel)");
+                    info!("{INNER_NAME}: BWU(actor) handoff to {new_medium:?} (nudging the prior channel)");
                     continue;
                 }
-                warn!("{INNER_NAME}: BWU(actor) saw LAST_WRITE but no WIFI_LAN channel; staying on L2CAP");
+                warn!("{INNER_NAME}: BWU(actor) saw LAST_WRITE but no WiFi channel; staying on L2CAP");
             }
 
             // Drive one frame/command. While an upgrade is offered but not yet handed
-            // off, bound the wait so a failed un-park can't hang the loop forever.
+            // off, bound the wait so a failed un-park can't hang the loop forever. The
+            // WIFI_HOTSPOT join (the phone leaves its infra WiFi, joins our AP, gets
+            // DHCP, then dials) measured ~9s in the spike and can exceed WIFI_LAN's
+            // 15s ceiling on a retry, so give the hotspot path a larger budget.
             let step = ir.handle_via_channel(&mut frame_rx);
             let r = if offered && !upgraded {
-                match tokio::time::timeout(std::time::Duration::from_secs(15), step).await {
+                let secs = if offer_medium == Medium::WifiHotspot {
+                    30
+                } else {
+                    15
+                };
+                match tokio::time::timeout(std::time::Duration::from_secs(secs), step).await {
                     Ok(r) => r,
                     Err(_) => {
-                        warn!("{INNER_NAME}: BWU(actor) upgrade stalled 15s; ending transfer");
+                        warn!("{INNER_NAME}: BWU(actor) upgrade stalled {secs}s; ending transfer");
                         break;
                     }
                 }
@@ -416,6 +465,11 @@ async fn handle(
             }
         }
 
+        // Deterministic teardown: Shutdown reverts every handler synchronously on the
+        // live actor task (WIFI_HOTSPOT → SoftAp::stop tears the AP down), so the
+        // SoftAP never outlives the transfer waiting on the async actor-abort/Drop
+        // chain. Bounded so a wedged teardown can't hang the connection task.
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(25), bwu.handle.shutdown()).await;
         drop(ecb); // keep the channel pumps alive until the loop ends
         drop(bwu);
         t_in.abort();

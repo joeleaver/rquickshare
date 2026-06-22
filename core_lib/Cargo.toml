@@ -51,6 +51,11 @@ prost-build = "0.13"
 [features]
 default = ["experimental"]
 experimental = ["bluer", "btleplug"]
+# Linux SoftAP for the WIFI_HOTSPOT bandwidth upgrade (Phase 4): NmSoftAp drives
+# NetworkManager (AP + shared IPv4/NAT) + a privileged vif helper to create the
+# `__ap` virtual interface. Linux-only, off by default; beamish enables it on the
+# native (.deb/.rpm/AppImage) build. Pairs with the QS_BWU_HOTSPOT runtime flag.
+linux-softap = []
 
 [profile.release]
 lto = true

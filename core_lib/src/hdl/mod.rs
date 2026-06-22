@@ -40,6 +40,10 @@ mod ukey_session;
 pub use ukey_session::UkeySession;
 // Staged for the QS_BWU_ACTOR receive-path inversion; re-exported when wired in.
 mod bwu_channel;
+// Linux SoftAP for the WIFI_HOTSPOT bandwidth upgrade (Phase 4). Off by default.
+// Internal to the crate: l2cap.rs constructs NmSoftAp directly (no re-export).
+#[cfg(all(feature = "linux-softap", target_os = "linux"))]
+mod nm_softap;
 mod mdns_discovery;
 pub use mdns_discovery::*;
 mod mdns;

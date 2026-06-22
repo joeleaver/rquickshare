@@ -26,8 +26,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
 use nearby_rs::bwu::{
-    BaseBwuHandler, BwuActor, BwuConfig, BwuHandle, BwuHandler, DuplexStream, StreamChannel,
-    WifiLanBwuHandler,
+    BaseBwuHandler, BwuActor, BwuConfig, BwuHandle, BwuHandler, DuplexStream, SoftAp, StreamChannel,
+    WifiHotspotBwuHandler, WifiLanBwuHandler,
 };
 use nearby_rs::frames::Exception;
 use nearby_rs::mediums::Medium;
@@ -214,10 +214,12 @@ impl Drop for EndpointChannelBridge {
     }
 }
 
-/// Owns a running [`BwuActor`] + its WIFI_LAN handler, and exposes the
+/// Owns a running [`BwuActor`] + its medium handlers, and exposes the
 /// [`BwuHandle`] the inverted (`QS_BWU_ACTOR`) receive loop drives. beamish is the
 /// BWU **initiator**: the WIFI_LAN handler binds a `TcpListener` (on `bind_ip`)
-/// and advertises `advertise_ip`, and its accept loop posts dialed sockets back to
+/// and advertises `advertise_ip`; the optional WIFI_HOTSPOT handler stands up a
+/// SoftAP via the injected [`SoftAp`] seam, binds on the AP gateway, and advertises
+/// the hotspot credentials. Each handler's accept loop posts dialed sockets back to
 /// the actor via the connection sink. Dropping the session aborts the actor task.
 pub struct BwuSession {
     /// Drive the actor from the receive loop: `connection_initiated`,
@@ -228,10 +230,18 @@ pub struct BwuSession {
 }
 
 impl BwuSession {
-    /// Build the actor with a WIFI_LAN handler and spawn it on the current Tokio
-    /// runtime. `local_endpoint_id` is our Nearby endpoint id; `bind_ip` is what
-    /// the upgrade `TcpListener` binds to (`0.0.0.0` in prod) and `advertise_ip`
-    /// is the routable LAN address put in the `UPGRADE_PATH_AVAILABLE` offer.
+    /// Build the actor with a WIFI_LAN handler (and, when `softap` is provided, a
+    /// WIFI_HOTSPOT handler) and spawn it on the current Tokio runtime.
+    /// `local_endpoint_id` is our Nearby endpoint id; `bind_ip` is what the WIFI_LAN
+    /// upgrade `TcpListener` binds to (`0.0.0.0` in prod) and `advertise_ip` is the
+    /// routable LAN address put in the WIFI_LAN `UPGRADE_PATH_AVAILABLE` offer.
+    ///
+    /// `softap` is the platform SoftAP seam (e.g. `NmSoftAp`). When `Some`, a
+    /// [`WifiHotspotBwuHandler`] is registered under [`Medium::WifiHotspot`] in
+    /// addition to WIFI_LAN, so the offer policy in `l2cap.rs` can initiate either
+    /// medium; the hotspot handler derives its own bind/gateway from
+    /// [`SoftAp::start`], so `bind_ip`/`advertise_ip` don't apply to it. `None` =
+    /// WIFI_LAN only (the default, hardware-agnostic path).
     ///
     /// **Runtime requirement:** call this on a **multi-thread** Tokio runtime. The
     /// BWU handshake does blocking channel I/O on the actor task — most notably the
@@ -244,13 +254,21 @@ impl BwuSession {
         local_endpoint_id: impl Into<String>,
         bind_ip: Ipv4Addr,
         advertise_ip: Ipv4Addr,
+        softap: Option<Arc<dyn SoftAp>>,
     ) -> Self {
-        // channel() first so the WIFI_LAN handler's accept loop has a sink to the
-        // actor before the actor exists.
+        // channel() first so each handler's accept loop has a sink to the actor
+        // before the actor exists.
         let (handle, rx) = BwuActor::channel(32);
-        let wifi = WifiLanBwuHandler::with_endpoint(handle.connection_sink(), bind_ip, advertise_ip);
         let mut handlers: HashMap<Medium, Box<dyn BwuHandler>> = HashMap::new();
+
+        let wifi = WifiLanBwuHandler::with_endpoint(handle.connection_sink(), bind_ip, advertise_ip);
         handlers.insert(Medium::WifiLan, Box::new(BaseBwuHandler::new(wifi)));
+
+        if let Some(softap) = softap {
+            let hotspot = WifiHotspotBwuHandler::new(softap, handle.connection_sink());
+            handlers.insert(Medium::WifiHotspot, Box::new(BaseBwuHandler::new(hotspot)));
+        }
+
         let actor = BwuActor::build(rx, handlers, BwuConfig::default(), local_endpoint_id);
         let actor_task = tokio::spawn(actor.run());
         Self { handle, actor_task }
@@ -380,7 +398,7 @@ mod tests {
 
         // Stand up the actor (initiator) and drive it to offer a WIFI_LAN upgrade
         // on the registered channel — the exact sequence the live receive loop uses.
-        let bwu = BwuSession::spawn("LOCL", Ipv4Addr::LOCALHOST, Ipv4Addr::LOCALHOST);
+        let bwu = BwuSession::spawn("LOCL", Ipv4Addr::LOCALHOST, Ipv4Addr::LOCALHOST, None);
         let ep = "PEER";
         bwu.handle.connection_initiated(ep, false, false).await;
         bwu.handle.connection_accepted(ep).await;
@@ -500,7 +518,7 @@ mod tests {
 
         // Initiator: stand up the actor and OFFER a WIFI_LAN upgrade on the OLD
         // channel — the live receive loop's exact sequence.
-        let bwu = BwuSession::spawn("LOCL", Ipv4Addr::LOCALHOST, Ipv4Addr::LOCALHOST);
+        let bwu = BwuSession::spawn("LOCL", Ipv4Addr::LOCALHOST, Ipv4Addr::LOCALHOST, None);
         // Baseline: no bandwidth change has happened yet, so the post-upgrade event
         // we assert later must be one this upgrade newly produced.
         assert!(
@@ -682,5 +700,190 @@ mod tests {
             3,
             "inbound seq continues (2 -> 3) on the new channel"
         );
+    }
+
+    /// The WIFI_HOTSPOT analogue of the WIFI_LAN upgrade above: when `BwuSession`
+    /// is given a [`SoftAp`], it registers a `WifiHotspotBwuHandler` and an
+    /// `initiate_bwu(ep, WifiHotspot)` runs the SAME full handshake — offer →
+    /// CLIENT_INTRODUCTION → LAST_WRITE → SAFE_TO_CLOSE → swap — converging to a
+    /// `Medium::WifiHotspot` channel with the d2d sequence preserved. Uses
+    /// [`FakeSoftAp`] (loopback creds) so the AP bring-up is a no-op and the phone
+    /// dials `127.0.0.1` over real TCP — the platform `NmSoftAp` is the only piece
+    /// this can't exercise without radios. Proves the offer-policy wiring (task #18)
+    /// can drive a hotspot upgrade end-to-end through the bridge stack.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn full_wifi_hotspot_upgrade_converges_through_bwu_session_over_real_tcp() {
+        use nearby_rs::bwu::{
+            ClientProxy, FakeSoftAp, MediumBwuHandler, SoftAp, WifiHotspotBwuHandler,
+        };
+        use nearby_rs::frames::{for_bwu_introduction, for_bwu_last_write, for_bwu_safe_to_close};
+
+        let ep = "PEER";
+        let ours = loopback_session();
+        let phone = loopback_session();
+
+        // OLD (L2CAP) channel; we play the phone on `peer`.
+        let (old_io, mut peer) = tokio::io::duplex(64 * 1024);
+        let ecb = EndpointChannelBridge::new(old_io, ours.clone(), "svc", Medium::BleL2cap);
+        let old_channel = ecb.channel.clone();
+
+        // Initiator: spawn the actor WITH a SoftAP seam, then offer a WIFI_HOTSPOT
+        // upgrade on the OLD channel.
+        let softap: Arc<dyn SoftAp> = Arc::new(FakeSoftAp::new());
+        let bwu = BwuSession::spawn("LOCL", Ipv4Addr::LOCALHOST, Ipv4Addr::LOCALHOST, Some(softap));
+        bwu.handle.connection_initiated(ep, false, false).await;
+        bwu.handle.connection_accepted(ep).await;
+        bwu.handle.register_channel(ep, old_channel.clone()).await;
+        bwu.handle.initiate_bwu(ep, Medium::WifiHotspot).await;
+        assert!(bwu.handle.is_upgrade_ongoing(ep).await);
+
+        // PHONE: read the encrypted WIFI_HOTSPOT UPGRADE_PATH_AVAILABLE + creds.
+        let info = {
+            let inner = phone_read_old(&mut peer, &phone).await;
+            nearby_rs::from_bytes(&inner)
+                .unwrap()
+                .v1
+                .unwrap()
+                .bandwidth_upgrade_negotiation
+                .unwrap()
+                .upgrade_path_info
+                .unwrap()
+        };
+        assert_eq!(
+            info.medium(),
+            nearby_rs::proto::bandwidth_upgrade_negotiation_frame::upgrade_path_info::Medium::WifiHotspot
+        );
+        // Pin the spike-validated wire contract: the Pixel accepted the offer because
+        // these exact fields were present. A future regression that drops/zeroes any
+        // of them must fail here, not silently in the field on a phone.
+        assert_eq!(
+            info.supports_client_introduction_ack,
+            Some(true),
+            "offer must request a CLIENT_INTRODUCTION ack (matches the spike)"
+        );
+        let creds = info
+            .wifi_hotspot_credentials
+            .as_ref()
+            .expect("the offer must carry WifiHotspotCredentials");
+        assert!(!creds.ssid().is_empty(), "ssid present");
+        assert!(!creds.password().is_empty(), "password present");
+        assert!(creds.port() > 0, "port present");
+        assert!(
+            creds.gateway().parse::<std::net::Ipv4Addr>().is_ok(),
+            "gateway parses to an IPv4 address"
+        );
+        assert!(creds.frequency.is_some(), "frequency set");
+
+        // PHONE: join the AP (FakeSoftAp = no-op) + dial the advertised socket via the
+        // responder side of the hotspot handler, send a plaintext CLIENT_INTRODUCTION.
+        let responder = std::thread::spawn({
+            let ep = ep.to_string();
+            move || {
+                let mut handler =
+                    WifiHotspotBwuHandler::new(Arc::new(FakeSoftAp::new()), Arc::new(|_| {}));
+                let new_chan = handler
+                    .create_upgraded_endpoint_channel(&ClientProxy::default(), "svc", &ep, &info)
+                    .expect("phone joins the SoftAP + dials the advertised socket");
+                assert_eq!(new_chan.medium(), Medium::WifiHotspot);
+                assert_eq!(
+                    new_chan.write(&for_bwu_introduction(&ep, "", false)),
+                    Exception::Success
+                );
+                new_chan
+                    .read()
+                    .expect("CLIENT_INTRODUCTION_ACK on the new channel");
+                new_chan
+            }
+        });
+
+        // OLD-channel teardown handshake, identical to WIFI_LAN.
+        let _our_last_write = phone_read_old(&mut peer, &phone).await;
+        phone_write_old(&mut peer, &phone, &for_bwu_last_write()).await;
+        let frame = consumer_read_bwu(&old_channel).await;
+        bwu.handle.incoming_frame(frame, ep, Medium::BleL2cap).await;
+
+        let _our_safe_to_close = phone_read_old(&mut peer, &phone).await;
+        phone_write_old(&mut peer, &phone, &for_bwu_safe_to_close()).await;
+        let frame = consumer_read_bwu(&old_channel).await;
+        bwu.handle.incoming_frame(frame, ep, Medium::BleL2cap).await;
+        drop(peer);
+
+        // Convergence: a (ep, WifiHotspot) bandwidth change is recorded.
+        let mut converged = false;
+        for _ in 0..300 {
+            if !bwu.handle.is_upgrade_ongoing(ep).await {
+                converged = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(converged, "the WIFI_HOTSPOT upgrade should converge");
+        assert!(
+            bwu.handle
+                .bandwidth_changed_events()
+                .await
+                .iter()
+                .any(|(id, m)| id == ep && *m == Medium::WifiHotspot),
+            "a (PEER, WifiHotspot) bandwidth change should be recorded"
+        );
+
+        // The upgraded channel is a WIFI_HOTSPOT channel, distinct from the old one.
+        let upgraded = bwu
+            .handle
+            .get_upgraded_channel(ep)
+            .await
+            .expect("the upgraded channel is retrievable after convergence");
+        assert_eq!(upgraded.medium(), Medium::WifiHotspot);
+        assert_ne!(
+            Arc::as_ptr(&old_channel) as *const (),
+            Arc::as_ptr(&upgraded) as *const (),
+            "the upgraded channel must be a different Arc than the old one"
+        );
+
+        // Seq continuity across the swap (out 3->4, in 2->3) — the same invariant
+        // the WIFI_LAN test proves, exercised over the hotspot channel.
+        assert_eq!(ours.server_seq(), 3, "outbound seq preserved across the swap");
+        assert_eq!(ours.client_seq(), 2, "inbound seq preserved across the swap");
+
+        let phone_new_chan = responder.join().unwrap();
+        upgraded.enable_encryption(ours.clone());
+        phone_new_chan.enable_encryption(phone.clone());
+
+        let payload = b"first payload after the hotspot upgrade".to_vec();
+        let wrote = {
+            let up = upgraded.clone();
+            let p = payload.clone();
+            tokio::task::spawn_blocking(move || up.write(&p))
+                .await
+                .unwrap()
+        };
+        assert_eq!(wrote, Exception::Success);
+        assert_eq!(ours.server_seq(), 4, "outbound seq continues (3 -> 4)");
+        let phone_got = {
+            let c = phone_new_chan.clone();
+            tokio::task::spawn_blocking(move || c.read())
+                .await
+                .unwrap()
+                .expect("phone decrypts our frame at the continued inbound seq (4)")
+        };
+        assert_eq!(phone_got, payload);
+
+        let reply = b"ack from the phone over the hotspot".to_vec();
+        {
+            let c = phone_new_chan.clone();
+            let r = reply.clone();
+            tokio::task::spawn_blocking(move || c.write(&r))
+                .await
+                .unwrap();
+        }
+        let our_got = {
+            let up = upgraded.clone();
+            tokio::task::spawn_blocking(move || up.read())
+                .await
+                .unwrap()
+                .expect("we decrypt the phone's frame at the continued inbound seq (3)")
+        };
+        assert_eq!(our_got, reply);
+        assert_eq!(ours.client_seq(), 3, "inbound seq continues (2 -> 3)");
     }
 }
