@@ -46,6 +46,10 @@ use rand::RngCore;
 const NM_CON_NAME: &str = "beamish-hotspot";
 /// NetworkManager's default gateway for an `ipv4.method=shared` connection.
 const SHARED_GATEWAY: Ipv4Addr = Ipv4Addr::new(10, 42, 0, 1);
+/// Where beamish packaging installs the privileged vif helper. When present we
+/// use it (via `pkexec` + polkit, no password for an active session) in preference
+/// to `sudo iw`; overridable with `QS_HOTSPOT_VIF_HELPER`.
+const DEFAULT_VIF_HELPER: &str = "/usr/libexec/beamish-vif-helper";
 
 /// How to create/delete the privileged `__ap` virtual interface.
 #[derive(Clone, Debug)]
@@ -84,8 +88,14 @@ impl NmSoftAp {
             .ok()
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| "ap0".to_string());
+        // Prefer the installed pkexec helper (the shippable path) when present;
+        // an explicit QS_HOTSPOT_VIF_HELPER overrides; else fall back to `sudo iw`
+        // for dev boxes with passwordless sudo.
         let vif = match std::env::var("QS_HOTSPOT_VIF_HELPER") {
             Ok(p) if !p.is_empty() => VifBackend::Helper(p),
+            _ if std::path::Path::new(DEFAULT_VIF_HELPER).exists() => {
+                VifBackend::Helper(DEFAULT_VIF_HELPER.to_string())
+            }
             _ => VifBackend::SudoIw,
         };
         info!("NmSoftAp: STA iface {sta_iface}, AP vif {ap_iface}, vif backend {vif:?}");
