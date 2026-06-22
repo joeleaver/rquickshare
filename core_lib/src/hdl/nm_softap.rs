@@ -62,9 +62,11 @@ enum VifBackend {
 }
 
 /// Per-activation state, set on [`start`](SoftAp::start), cleared on
-/// [`stop`](SoftAp::stop).
+/// [`stop`](SoftAp::stop). Caches the credentials of the standing AP so a repeat
+/// `start()` (the pre-warm vs the handler, or a retry) reuses it instead of
+/// re-creating it.
 struct ApState {
-    ssid: String,
+    creds: HotspotCreds,
 }
 
 /// Linux SoftAP via NetworkManager + a privileged vif helper.
@@ -174,6 +176,21 @@ impl Drop for NmSoftAp {
 
 impl SoftAp for NmSoftAp {
     fn start(&self, _service_id: &str) -> Option<HotspotCreds> {
+        // Hold the state lock across the whole bring-up: concurrent callers (the
+        // l2cap pre-warm task and the BWU handler) then can't double-create the AP —
+        // the first brings it up + caches the creds, the rest wait on the lock and
+        // return the cache. Idempotent: a start() on an already-up AP is a no-op that
+        // returns the cached creds, so the pre-warm makes the handler's offer instant
+        // and retries reuse the standing AP instead of churning it.
+        let mut guard = self.state.lock().unwrap();
+        if let Some(state) = guard.as_ref() {
+            info!(
+                "NmSoftAp: start() reusing the standing SoftAP ssid={} (pre-warm hit)",
+                state.creds.ssid
+            );
+            return Some(state.creds.clone());
+        }
+
         // Detect the STA's current frequency so the AP can be pinned co-channel. A
         // single-radio chip (the MT7925 this targets) can only run an AP on the
         // STA's channel, so a *guessed* channel risks bringing the AP up on the
@@ -259,22 +276,25 @@ impl SoftAp for NmSoftAp {
 
         // The actual gateway NM assigned (10.42.0.1 for the first shared conn).
         let gateway = detect_iface_ipv4(&self.ap_iface).unwrap_or(SHARED_GATEWAY);
-        *self.state.lock().unwrap() = Some(ApState { ssid: ssid.clone() });
-        info!(
-            "NmSoftAp: SoftAP up — ssid={ssid} band={band} channel={channel} freq={freq} gateway={gateway}"
-        );
-        Some(HotspotCreds {
-            ssid,
+        let creds = HotspotCreds {
+            ssid: ssid.clone(),
             password: psk,
             frequency: freq as i32,
             gateway,
             bind_ip: gateway,
-        })
+        };
+        *guard = Some(ApState {
+            creds: creds.clone(),
+        });
+        info!(
+            "NmSoftAp: SoftAP up — ssid={ssid} band={band} channel={channel} freq={freq} gateway={gateway}"
+        );
+        Some(creds)
     }
 
     fn stop(&self, _service_id: &str) {
         match self.state.lock().unwrap().take() {
-            Some(state) => info!("NmSoftAp: tearing down SoftAP ssid={}", state.ssid),
+            Some(state) => info!("NmSoftAp: tearing down SoftAP ssid={}", state.creds.ssid),
             None => debug!("NmSoftAp: stop with no active AP (ignored)"),
         }
         self.teardown();

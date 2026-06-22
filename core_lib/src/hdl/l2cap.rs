@@ -324,6 +324,20 @@ async fn handle(
             Medium::WifiLan
         };
 
+        // Pre-warm: stand the SoftAP up NOW, off-thread, so its (variable, up to a
+        // few-second) bring-up overlaps the BLE/UKEY2 handshake. NmSoftAp::start is
+        // idempotent + cached on the shared Arc, so when the handler later calls it
+        // (during initiate_bwu) it returns the cached creds instantly and the
+        // WIFI_HOTSPOT offer goes out with no AP-bring-up latency on the critical
+        // path. The handler's revert/our shutdown() tears down this same cached AP.
+        if let Some(sa) = softap.clone() {
+            tokio::task::spawn_blocking(move || {
+                if sa.start("beamish").is_some() {
+                    info!("{INNER_NAME}: BWU(actor) pre-warmed the SoftAP (overlapping the handshake)");
+                }
+            });
+        }
+
         // The BwuActor + its medium handlers: the WIFI_LAN handler binds 0.0.0.0 and
         // advertises the LAN IP the phone dials; the (optional) WIFI_HOTSPOT handler
         // derives its bind/gateway from the SoftAP. The actor offers
