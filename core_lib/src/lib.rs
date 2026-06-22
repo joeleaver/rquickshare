@@ -203,8 +203,14 @@ impl RQS {
             let ctk = ctoken.clone();
             let inner_l2 = inner.clone();
             let l2_sender = self.message_sender.clone();
+            // Hand the L2CAP server the tracker so its per-connection tasks are
+            // tracked too — then RQS::stop()'s tracker.wait() awaits an in-flight
+            // WIFI_HOTSPOT teardown instead of letting the runtime drop race it.
+            let l2_tracker = tracker.clone();
             tracker.spawn(async move {
-                if let Err(e) = hdl::L2capServer::new(psm, inner_l2, l2_sender).run(ctk).await {
+                if let Err(e) =
+                    hdl::L2capServer::new(psm, inner_l2, l2_sender).run(ctk, l2_tracker).await
+                {
                     error!("L2capServer error: {e}");
                 }
             });

@@ -27,6 +27,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::broadcast::Sender;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 
 use crate::channel::ChannelMessage;
 
@@ -62,7 +63,7 @@ impl L2capServer {
         Self { psm, inner, sender }
     }
 
-    pub async fn run(self, ctk: CancellationToken) -> Result<(), anyhow::Error> {
+    pub async fn run(self, ctk: CancellationToken, tracker: TaskTracker) -> Result<(), anyhow::Error> {
         let sa = SocketAddr::new(Address::any(), AddressType::LePublic, self.psm);
         let listener = StreamListener::bind(sa).await?;
         info!("{INNER_NAME}: listening on LE L2CAP PSM {:#06x}", self.psm);
@@ -80,8 +81,14 @@ impl L2capServer {
                             let inner = self.inner.clone();
                             let sender = self.sender.clone();
                             let id = peer.addr.to_string();
-                            tokio::spawn(async move {
-                                if let Err(e) = handle(stream, inner, sender, id).await {
+                            // Hand the per-connection task the cancellation token so a
+                            // graceful shutdown (RQS::stop) tears down an in-flight
+                            // WIFI_HOTSPOT SoftAP instead of leaking it, and spawn it
+                            // ON THE TRACKER so RQS::stop()'s tracker.wait() awaits that
+                            // teardown before the runtime is dropped.
+                            let conn_ctk = ctk.clone();
+                            tracker.spawn(async move {
+                                if let Err(e) = handle(stream, inner, sender, id, conn_ctk).await {
                                     debug!("{INNER_NAME}: connection ended: {e}");
                                 }
                             });
@@ -158,6 +165,7 @@ async fn handle(
     inner: Vec<u8>,
     sender: Sender<ChannelMessage>,
     id: String,
+    ctk: CancellationToken,
 ) -> Result<(), anyhow::Error> {
     // Phase 1: BleL2capPacket handshake — answer advert fetches and the data
     // connection request. Returns once the data connection is ready.
@@ -435,21 +443,36 @@ async fn handle(
             // DHCP, then dials) measured ~9s in the spike and can exceed WIFI_LAN's
             // 15s ceiling on a retry, so give the hotspot path a larger budget.
             let step = ir.handle_via_channel(&mut frame_rx);
+            // A graceful shutdown (RQS::stop cancels the token) must break out of the
+            // loop so the post-loop `bwu.handle.shutdown()` tears down any in-flight
+            // SoftAP rather than leaking it past process exit.
             let r = if offered && !upgraded {
                 let secs = if offer_medium == Medium::WifiHotspot {
                     30
                 } else {
                     15
                 };
-                match tokio::time::timeout(std::time::Duration::from_secs(secs), step).await {
-                    Ok(r) => r,
-                    Err(_) => {
-                        warn!("{INNER_NAME}: BWU(actor) upgrade stalled {secs}s; ending transfer");
+                tokio::select! {
+                    _ = ctk.cancelled() => {
+                        info!("{INNER_NAME}: BWU(actor) cancelled mid-upgrade; tearing down");
                         break;
+                    }
+                    r = tokio::time::timeout(std::time::Duration::from_secs(secs), step) => match r {
+                        Ok(r) => r,
+                        Err(_) => {
+                            warn!("{INNER_NAME}: BWU(actor) upgrade stalled {secs}s; ending transfer");
+                            break;
+                        }
                     }
                 }
             } else {
-                step.await
+                tokio::select! {
+                    _ = ctk.cancelled() => {
+                        info!("{INNER_NAME}: BWU(actor) cancelled; tearing down");
+                        break;
+                    }
+                    r = step => r,
+                }
             };
             match r {
                 Ok(()) => {}
